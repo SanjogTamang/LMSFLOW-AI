@@ -1,4 +1,4 @@
-# Seoul Christian University (SCU) LMS Multi-User AI Platform
+# Seoul Christian University (SCU) LMS Multi-User AI Platform Designed by Sanjog
 
 An enterprise-grade, multi-user academic platform designed for students of **Seoul Christian University (SCU)** ([https://lms.scu.ac.kr](https://lms.scu.ac.kr)) to manage, draft, compile, and safely verify LMS course assignments.
 

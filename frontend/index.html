@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SCU LMS - Multi-User AI Academic Platform</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React 18 & ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <!-- Babel for direct JSX interpretation -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+    .bg-navy { background-color: #0d1b2a; }
+    .bg-scu { background-color: #1b4965; }
+    .text-scu { color: #1b4965; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    const API_BASE = "";
+
+    function App() {
+      // Auth State
+      const [token, setToken] = useState(localStorage.getItem("scu_token") || "");
+      const [user, setUser] = useState(JSON.parse(localStorage.getItem("scu_user") || "null"));
+      const [authMode, setAuthMode] = useState("login"); // 'login' or 'register'
+      
+      // Form States
+      const [email, setEmail] = useState("");
+      const [password, setPassword] = useState("");
+      const [fullName, setFullName] = useState("");
+      const [studentId, setStudentId] = useState("");
+      const [authError, setAuthError] = useState("");
+      const [loading, setLoading] = useState(false);
+
+      // App Views
+      const [currentView, setCurrentView] = useState("dashboard"); // 'dashboard', 'lms_settings', 'workspace', 'audit'
+      const [assignments, setAssignments] = useState([]);
+      const [selectedAssignment, setSelectedAssignment] = useState(null);
+      const [draft, setDraft] = useState(null);
+      const [lmsConnection, setLmsConnection] = useState(null);
+      const [activeJob, setActiveJob] = useState(null);
+      const [auditEvents, setAuditEvents] = useState([]);
+
+      // LMS Connect Form
+      const [lmsIdInput, setLmsIdInput] = useState("");
+      const [lmsPwInput, setLmsPwInput] = useState("");
+      const [lmsMsg, setLmsMsg] = useState("");
+
+      // Modals
+      const [showSubmitModal, setShowSubmitModal] = useState(false);
+      const [showNewAssignModal, setShowNewAssignModal] = useState(false);
+      const [newCourse, setNewCourse] = useState("");
+      const [newTitle, setNewTitle] = useState("");
+      const [newInstructions, setNewInstructions] = useState("");
+
+      const authHeaders = {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`,
+        "X-User-Id": user?.id || "",
+        "X-User-Email": user?.email || ""
+      };
+
+      // ── Effect: Load profile and initial data on login ──
+      useEffect(() => {
+        if (token && user) {
+          fetchAssignments();
+          fetchLmsStatus();
+        }
+      }, [token]);
+
+      // ── Effect: Poll running background job ──
+      useEffect(() => {
+        let interval;
+        if (activeJob && activeJob.status === "processing") {
+          interval = setInterval(async () => {
+            try {
+              const res = await fetch(`${API_BASE}/api/jobs/${activeJob.id}`, { headers: authHeaders });
+              const data = await res.json();
+              setActiveJob(data);
+              if (data.status === "completed" || data.status === "failed") {
+                fetchAssignments();
+                if (selectedAssignment) fetchDraft(selectedAssignment.id);
+              }
+            } catch (err) {
+              console.error(err);
+            }
+          }, 2000);
+        }
+        return () => clearInterval(interval);
+      }, [activeJob]);
+
+      // Auth Handlers
+      async function handleAuth(e) {
+        e.preventDefault();
+        setAuthError("");
+        setLoading(true);
+        const endpoint = authMode === "login" ? "/api/auth/login" : "/api/auth/register";
+        const payload = authMode === "login" 
+          ? { student_id: studentId.trim(), password } 
+          : { student_id: studentId.trim(), password, full_name: fullName, email: email || `${studentId.trim()}@scu.ac.kr` };
+
+        try {
+          const res = await fetch(`${API_BASE}${endpoint}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Authentication failed");
+
+          setToken(data.token);
+          setUser(data.user);
+          localStorage.setItem("scu_token", data.token);
+          localStorage.setItem("scu_user", JSON.stringify(data.user));
+          if (data.user.scu_student_id) {
+            setLmsIdInput(data.user.scu_student_id);
+          }
+        } catch (err) {
+          setAuthError(err.message);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      function handleLogout() {
+        setToken("");
+        setUser(null);
+        localStorage.removeItem("scu_token");
+        localStorage.removeItem("scu_user");
+        setAssignments([]);
+        setSelectedAssignment(null);
+      }
+
+      // ── API Fetchers ──
+      async function fetchAssignments() {
+        try {
+          const res = await fetch(`${API_BASE}/api/assignments`, { headers: authHeaders });
+          if (res.ok) {
+            const data = await res.json();
+            setAssignments(data);
+          }
+        } catch (e) { console.error(e); }
+      }
+
+      async function fetchLmsStatus() {
+        try {
+          const res = await fetch(`${API_BASE}/api/lms/status`, { headers: authHeaders });
+          if (res.ok) {
+            const data = await res.json();
+            setLmsConnection(data);
+            if (data.lms_student_id) setLmsIdInput(data.lms_student_id);
+          }
+        } catch (e) { console.error(e); }
+      }
+
+      async function fetchDraft(assignmentId) {
+        try {
+          const res = await fetch(`${API_BASE}/api/assignments/${assignmentId}/draft`, { headers: authHeaders });
+          if (res.ok) {
+            const data = await res.json();
+            setDraft(data);
+          } else {
+            setDraft(null);
+          }
+        } catch (e) { console.error(e); }
+      }
+
+      async function fetchAuditEvents() {
+        try {
+          const res = await fetch(`${API_BASE}/api/audit-events`, { headers: authHeaders });
+          if (res.ok) {
+            const data = await res.json();
+            setAuditEvents(data);
+          }
+        } catch (e) { console.error(e); }
+      }
+
+      // ── LMS Actions ──
+      async function handleConnectLMS(e) {
+        e.preventDefault();
+        setLmsMsg("Testing connection against SCU LMS with Playwright...");
+        setLoading(true);
+        try {
+          const res = await fetch(`${API_BASE}/api/lms/connect`, {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({ lms_student_id: lmsIdInput, lms_password: lmsPwInput })
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Connection failed");
+          setLmsConnection(data);
+          setLmsMsg("✅ SCU LMS connected successfully! AES-256 encrypted.");
+          setLmsPwInput("");
+        } catch (err) {
+          setLmsMsg(`❌ ${err.message}`);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      async function handleSyncLMS() {
+        setLoading(true);
+        try {
+          const res = await fetch(`${API_BASE}/api/assignments/sync-lms`, {
+            method: "POST",
+            headers: authHeaders
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "LMS sync failed");
+          alert(data.message);
+          await fetchAssignments();
+        } catch (err) {
+          alert("Sync error: " + err.message);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      // ── Assignment & Workspace Actions ──
+      async function handleCreateAssignment(e) {
+        e.preventDefault();
+        try {
+          const res = await fetch(`${API_BASE}/api/assignments`, {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({
+              course_name: newCourse,
+              assignment_title: newTitle,
+              instructions: newInstructions
+            })
+          });
+          if (res.ok) {
+            setShowNewAssignModal(false);
+            setNewCourse(""); setNewTitle(""); setNewInstructions("");
+            fetchAssignments();
+          }
+        } catch (err) { alert(err.message); }
+      }
+
+      async function openWorkspace(assignment) {
+        setSelectedAssignment(assignment);
+        setCurrentView("workspace");
+        await fetchDraft(assignment.id);
+      }
+
+      async function handleGenerateDraft() {
+        setLoading(true);
+        try {
+          const res = await fetch(`${API_BASE}/api/assignments/${selectedAssignment.id}/generate-draft`, {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({ custom_instructions: "" })
+          });
+          const data = await res.json();
+          setDraft(data);
+          fetchAssignments();
+        } catch (err) {
+          alert("AI Generation error: " + err.message);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      async function handleApproveDraft() {
+        try {
+          const res = await fetch(`${API_BASE}/api/assignments/${selectedAssignment.id}/approve`, {
+            method: "POST",
+            headers: authHeaders
+          });
+          if (res.ok) {
+            alert("Draft approved! You can now generate the PDF.");
+            fetchDraft(selectedAssignment.id);
+            fetchAssignments();
+          }
+        } catch (err) { alert(err.message); }
+      }
+
+      async function handleBuildPDF() {
+        setLoading(true);
+        try {
+          const res = await fetch(`${API_BASE}/api/assignments/${selectedAssignment.id}/generate-pdf`, {
+            method: "POST",
+            headers: authHeaders
+          });
+          if (res.ok) {
+            alert("PDF compiled successfully via ReportLab!");
+            fetchAssignments();
+          } else {
+            const err = await res.json();
+            alert(err.detail);
+          }
+        } catch (err) { alert(err.message); }
+        finally { setLoading(false); }
+      }
+
+      async function handleTriggerSubmitJob() {
+        setShowSubmitModal(false);
+        try {
+          const res = await fetch(`${API_BASE}/api/assignments/${selectedAssignment.id}/submit-job`, {
+            method: "POST",
+            headers: authHeaders,
+            body: JSON.stringify({ confirm_submission: true })
+          });
+          const data = await res.json();
+          if (res.ok) {
+            setActiveJob(data);
+          } else {
+            alert(data.detail);
+          }
+        } catch (err) { alert(err.message); }
+      }
+
+      // ── View: Unauthenticated Login / Register ──
+      if (!token || !user) {
+        return (
+          <div className="min-h-screen flex items-center justify-center p-4 bg-slate-100">
+            <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 border border-slate-200">
+              <div className="text-center mb-8">
+                <div className="w-16 h-16 bg-blue-900 text-white rounded-2xl flex items-center justify-center mx-auto mb-4 text-2xl font-bold shadow-lg">
+                  SCU
+                </div>
+                <h1 className="text-2xl font-bold text-slate-800">Seoul Christian University</h1>
+                <p className="text-sm text-slate-500 mt-1">Multi-User LMS AI Assignment Automation</p>
+              </div>
+
+              {authError && (
+                <div className="mb-4 p-3 bg-red-50 text-red-700 text-sm rounded-lg border border-red-200">
+                  {authError}
+                </div>
+              )}
+
+              <form onSubmit={handleAuth} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-600 mb-1">SCU STUDENT ID (학번)</label>
+                  <input 
+                    type="text" 
+                    required 
+                    value={studentId} 
+                    onChange={e => setStudentId(e.target.value)}
+                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-800 outline-none" 
+                    placeholder="e.g. 20240301001"
+                  />
+                </div>
+
+                {authMode === "register" && (
+                  <>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-600 mb-1">FULL NAME (이름)</label>
+                      <input 
+                        type="text" 
+                        required 
+                        value={fullName} 
+                        onChange={e => setFullName(e.target.value)}
+                        className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-800 outline-none" 
+                        placeholder="e.g. Sanjog Shrestha"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-600 mb-1">EMAIL ADDRESS (선택)</label>
+                      <input 
+                        type="email" 
+                        value={email} 
+                        onChange={e => setEmail(e.target.value)}
+                        className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-800 outline-none" 
+                        placeholder="student@scu.ac.kr (optional)"
+                      />
+                    </div>
+                  </>
+                )}
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-600 mb-1">PASSWORD (비밀번호)</label>
+                  <input 
+                    type="password" 
+                    required 
+                    value={password} 
+                    onChange={e => setPassword(e.target.value)}
+                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-800 outline-none" 
+                    placeholder="••••••••"
+                  />
+                </div>
+
+                <button 
+                  type="submit" 
+                  disabled={loading}
+                  className="w-full py-3 bg-blue-900 hover:bg-blue-800 text-white font-semibold rounded-lg shadow-md transition-all flex items-center justify-center space-x-2"
+                >
+                  {loading && <i className="fa-solid fa-spinner fa-spin"></i>}
+                  <span>{authMode === "login" ? "Sign In with Student ID" : "Register Student Account"}</span>
+                </button>
+              </form>
+
+              <div className="mt-6 text-center text-sm text-slate-500">
+                {authMode === "login" ? (
+                  <p>Don't have an account? <button onClick={() => setAuthMode("register")} className="text-blue-800 font-semibold underline">Register here</button></p>
+                ) : (
+                  <p>Already registered? <button onClick={() => setAuthMode("login")} className="text-blue-800 font-semibold underline">Sign In</button></p>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      // ── Main Authenticated Layout ──
+      return (
+        <div className="min-h-screen flex flex-col">
+          {/* Top Navbar */}
+          <header className="bg-blue-950 text-white shadow-md sticky top-0 z-40">
+            <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+              <div className="flex items-center space-x-3 cursor-pointer" onClick={() => setCurrentView("dashboard")}>
+                <div className="w-9 h-9 bg-blue-700 rounded-lg flex items-center justify-center font-bold text-white shadow">
+                  SCU
+                </div>
+                <div>
+                  <div className="font-bold tracking-tight text-sm md:text-base">Seoul Christian University</div>
+                  <div className="text-xs text-blue-300">Multi-User LMS Automation Platform</div>
+                </div>
+              </div>
+
+              {/* Navigation Tabs */}
+              <div className="flex items-center space-x-1 md:space-x-4">
+                <button 
+                  onClick={() => setCurrentView("dashboard")} 
+                  className={`px-3 py-1.5 rounded-lg text-xs md:text-sm font-medium ${currentView === 'dashboard' ? 'bg-blue-800 text-white' : 'text-blue-200 hover:bg-blue-900'}`}
+                >
+                  <i className="fa-solid fa-book-open mr-1.5"></i> My Assignments
+                </button>
+                <button 
+                  onClick={() => setCurrentView("lms_settings")} 
+                  className={`px-3 py-1.5 rounded-lg text-xs md:text-sm font-medium ${currentView === 'lms_settings' ? 'bg-blue-800 text-white' : 'text-blue-200 hover:bg-blue-900'}`}
+                >
+                  <i className="fa-solid fa-plug mr-1.5"></i> LMS Connection
+                  {lmsConnection?.connection_status === 'connected' && <span className="ml-1.5 w-2 h-2 bg-emerald-400 rounded-full inline-block"></span>}
+                </button>
+                <button 
+                  onClick={() => { setCurrentView("audit"); fetchAuditEvents(); }} 
+                  className={`px-3 py-1.5 rounded-lg text-xs md:text-sm font-medium ${currentView === 'audit' ? 'bg-blue-800 text-white' : 'text-blue-200 hover:bg-blue-900'}`}
+                >
+                  <i className="fa-solid fa-shield-halved mr-1.5"></i> Audit Logs
+                </button>
+
+                {/* Profile Pill & Logout */}
+                <div className="flex items-center pl-3 border-l border-blue-800 space-x-2">
+                  <div className="hidden md:block text-right">
+                    <div className="text-xs font-semibold">{user.full_name}</div>
+                    <div className="text-[10px] text-blue-300 font-mono">학번: {user.scu_student_id || user.email}</div>
+                  </div>
+                  <button 
+                    onClick={handleLogout} 
+                    title="Sign Out"
+                    className="p-2 text-blue-300 hover:text-white rounded-lg hover:bg-blue-900 transition"
+                  >
+                    <i className="fa-solid fa-arrow-right-from-bracket"></i>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Real-time Background Job Notification Banner */}
+            {activeJob && (
+              <div className="bg-indigo-900 border-t border-indigo-700 px-4 py-2">
+                <div className="max-w-7xl mx-auto flex items-center justify-between text-xs">
+                  <div className="flex items-center space-x-2">
+                    {activeJob.status === 'processing' ? <i className="fa-solid fa-spinner fa-spin text-amber-400"></i> : <i className="fa-solid fa-circle-check text-emerald-400"></i>}
+                    <span><strong>Task:</strong> {activeJob.current_step}</span>
+                  </div>
+                  <div className="flex items-center space-x-3">
+                    <div className="w-32 bg-indigo-950 rounded-full h-2 overflow-hidden border border-indigo-700">
+                      <div className="bg-emerald-400 h-full transition-all" style={{ width: `${activeJob.progress_percentage}%` }}></div>
+                    </div>
+                    <span>{activeJob.progress_percentage}%</span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </header>
+
+          {/* Main Content Area */}
+          <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6">
+
+            {/* VIEW 1: LMS SETTINGS */}
+            {currentView === "lms_settings" && (
+              <div className="max-w-2xl mx-auto bg-white rounded-2xl p-6 md:p-8 shadow-sm border border-slate-200">
+                <div className="flex items-center space-x-3 mb-6">
+                  <div className="w-12 h-12 bg-blue-50 text-blue-900 rounded-xl flex items-center justify-center text-xl">
+                    <i className="fa-solid fa-university"></i>
+                  </div>
+                  <div>
+                    <h2 className="text-xl font-bold">SCU LMS Student Connection</h2>
+                    <p className="text-xs text-slate-500">Each student authenticates their own personal LMS portal (<a href="https://lms.scu.ac.kr" target="_blank" className="underline text-blue-600">lms.scu.ac.kr</a>)</p>
+                  </div>
+                </div>
+
+                <div className="p-4 bg-slate-50 rounded-xl mb-6 border border-slate-200">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-semibold">Connection Status:</span>
+                    <span className={`px-2.5 py-1 rounded-full text-xs font-bold uppercase ${lmsConnection?.connection_status === 'connected' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
+                      {lmsConnection?.connection_status || 'Disconnected'}
+                    </span>
+                  </div>
+                  {lmsConnection?.last_verified_at && (
+                    <div className="text-xs text-slate-500 mt-2">
+                      Last Verified: {new Date(lmsConnection.last_verified_at).toLocaleString()}
+                    </div>
+                  )}
+                </div>
+
+                {lmsMsg && (
+                  <div className="mb-4 p-3 bg-blue-50 text-blue-900 text-sm rounded-lg border border-blue-200">
+                    {lmsMsg}
+                  </div>
+                )}
+
+                <form onSubmit={handleConnectLMS} className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">SCU STUDENT ID (학번)</label>
+                    <input 
+                      type="text" 
+                      required 
+                      value={lmsIdInput} 
+                      onChange={e => setLmsIdInput(e.target.value)}
+                      placeholder="e.g. 20240301001"
+                      className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-900 outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">SCU LMS PASSWORD (비밀번호)</label>
+                    <input 
+                      type="password" 
+                      required 
+                      value={lmsPwInput} 
+                      onChange={e => setLmsPwInput(e.target.value)}
+                      placeholder="••••••••"
+                      className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-900 outline-none"
+                    />
+                    <p className="text-[11px] text-slate-400 mt-1">🔒 Stored using AES-256 Fernet Encryption. Never logged or exposed.</p>
+                  </div>
+
+                  <div className="pt-2 flex items-center space-x-3">
+                    <button 
+                      type="submit" 
+                      disabled={loading}
+                      className="px-6 py-2.5 bg-blue-900 hover:bg-blue-800 text-white font-semibold rounded-lg shadow transition flex items-center space-x-2 text-sm"
+                    >
+                      {loading && <i className="fa-solid fa-spinner fa-spin"></i>}
+                      <span>Verify & Connect to LMS</span>
+                    </button>
+                    {lmsConnection?.connection_status === 'connected' && (
+                      <button 
+                        type="button" 
+                        onClick={async () => {
+                          await fetch(`${API_BASE}/api/lms/disconnect`, { method: "DELETE", headers: authHeaders });
+                          fetchLmsStatus();
+                        }}
+                        className="px-4 py-2.5 border border-red-300 text-red-600 hover:bg-red-50 font-medium rounded-lg text-sm"
+                      >
+                        Disconnect & Purge
+                      </button>
+                    )}
+                  </div>
+                </form>
+              </div>
+            )}
+
+            {/* VIEW 2: ASSIGNMENTS DASHBOARD */}
+            {currentView === "dashboard" && (
+              <div>
+                {/* Header actions */}
+                <div className="flex flex-col md:flex-row md:items-center justify-between pb-6 border-b border-slate-200 mb-6 gap-4">
+                  <div>
+                    <h1 className="text-2xl font-bold text-slate-800">Student Assignment Portal</h1>
+                    <p className="text-xs text-slate-500 mt-1">Courses and assignments assigned exclusively to your student account.</p>
+                  </div>
+                  <div className="flex items-center space-x-3">
+                    <button 
+                      onClick={handleSyncLMS}
+                      disabled={loading}
+                      className="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs md:text-sm font-semibold rounded-lg shadow-sm flex items-center space-x-2"
+                    >
+                      <i className="fa-solid fa-rotate text-blue-900"></i>
+                      <span>Sync from SCU LMS</span>
+                    </button>
+                    <button 
+                      onClick={() => setShowNewAssignModal(true)}
+                      className="px-4 py-2 bg-blue-900 hover:bg-blue-800 text-white text-xs md:text-sm font-semibold rounded-lg shadow flex items-center space-x-2"
+                    >
+                      <i className="fa-solid fa-plus"></i>
+                      <span>New Assignment</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Assignment Cards Grid */}
+                {assignments.length === 0 ? (
+                  <div className="text-center py-16 bg-white rounded-2xl border border-dashed border-slate-300">
+                    <i className="fa-solid fa-folder-open text-4xl text-slate-300 mb-3"></i>
+                    <h3 className="font-semibold text-slate-700">No Assignments Found</h3>
+                    <p className="text-xs text-slate-400 max-w-sm mx-auto mt-1 mb-4">Click "Sync from SCU LMS" to retrieve your enrolled courses or create an assignment entry manually.</p>
+                    <button onClick={handleSyncLMS} className="px-4 py-2 bg-blue-900 text-white rounded-lg text-xs font-semibold">
+                      Sync LMS Now
+                    </button>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                    {assignments.map(item => (
+                      <div 
+                        key={item.id} 
+                        className="bg-white rounded-2xl p-5 border border-slate-200 shadow-sm hover:shadow-md transition flex flex-col justify-between"
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-[11px] font-bold text-blue-900 uppercase tracking-wider bg-blue-50 px-2 py-0.5 rounded">
+                              {item.course_name}
+                            </span>
+                            <span className="text-[10px] font-semibold text-slate-500 capitalize">
+                              {item.current_status.replace(/_/g, " ")}
+                            </span>
+                          </div>
+                          <h3 className="font-bold text-slate-800 text-base mb-2 line-clamp-1">{item.assignment_title}</h3>
+                          <p className="text-xs text-slate-500 line-clamp-3 mb-4">{item.instructions || "No specific instructions provided."}</p>
+                        </div>
+
+                        <div>
+                          {/* Progress pipeline indicator */}
+                          <div className="w-full bg-slate-100 rounded-full h-1.5 mb-4 overflow-hidden">
+                            <div 
+                              className="bg-blue-900 h-full transition-all"
+                              style={{ 
+                                width: item.current_status === 'verified' ? '100%' 
+                                  : item.current_status === 'pdf_generated' ? '75%' 
+                                  : item.current_status === 'draft_generated' ? '50%' 
+                                  : '20%' 
+                              }}
+                            ></div>
+                          </div>
+
+                          <button 
+                            onClick={() => openWorkspace(item)}
+                            className="w-full py-2 bg-slate-50 hover:bg-blue-50 text-blue-900 font-semibold rounded-lg border border-slate-200 text-xs flex items-center justify-center space-x-2 transition"
+                          >
+                            <span>Open Workspace</span>
+                            <i className="fa-solid fa-arrow-right"></i>
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* VIEW 3: ASSIGNMENT WORKSPACE */}
+            {currentView === "workspace" && selectedAssignment && (
+              <div>
+                <div className="flex items-center space-x-3 mb-6">
+                  <button onClick={() => setCurrentView("dashboard")} className="p-2 hover:bg-slate-200 rounded-lg">
+                    <i className="fa-solid fa-arrow-left"></i>
+                  </button>
+                  <div>
+                    <span className="text-xs font-bold text-blue-900 uppercase bg-blue-50 px-2 py-0.5 rounded">{selectedAssignment.course_name}</span>
+                    <h1 className="text-xl font-bold text-slate-800 mt-1">{selectedAssignment.assignment_title}</h1>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  {/* Left Column: Instructions & Actions */}
+                  <div className="lg:col-span-1 space-y-6">
+                    <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+                      <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Assignment Requirements</h3>
+                      <div className="text-xs text-slate-700 whitespace-pre-wrap leading-relaxed max-h-48 overflow-y-auto p-2 bg-slate-50 rounded-lg">
+                        {selectedAssignment.instructions || "General assignment requirements."}
+                      </div>
+                    </div>
+
+                    <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-3">
+                      <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Workflow Controls</h3>
+                      
+                      {/* 1. Gemini AI Draft */}
+                      <button 
+                        onClick={handleGenerateDraft} 
+                        disabled={loading}
+                        className="w-full py-2.5 bg-blue-900 hover:bg-blue-800 text-white rounded-lg text-xs font-semibold shadow flex items-center justify-center space-x-2"
+                      >
+                        <i className="fa-solid fa-wand-magic-sparkles"></i>
+                        <span>Generate with Gemini AI</span>
+                      </button>
+
+                      {/* 2. Approve Draft */}
+                      {draft && !draft.is_student_approved && (
+                        <button 
+                          onClick={handleApproveDraft} 
+                          className="w-full py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold shadow flex items-center justify-center space-x-2"
+                        >
+                          <i className="fa-solid fa-check"></i>
+                          <span>Review & Approve Draft</span>
+                        </button>
+                      )}
+
+                      {/* 3. Build ReportLab PDF */}
+                      {draft && (
+                        <button 
+                          onClick={handleBuildPDF} 
+                          disabled={loading}
+                          className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-lg text-xs font-semibold shadow flex items-center justify-center space-x-2"
+                        >
+                          <i className="fa-solid fa-file-pdf"></i>
+                          <span>Compile ReportLab PDF</span>
+                        </button>
+                      )}
+
+                      {/* 4. Download PDF Link */}
+                      <a 
+                        href={`${API_BASE}/api/assignments/${selectedAssignment.id}/download-pdf`}
+                        target="_blank"
+                        className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold shadow flex items-center justify-center space-x-2"
+                      >
+                        <i className="fa-solid fa-download"></i>
+                        <span>Download / Preview PDF</span>
+                      </a>
+
+                      {/* 5. Safe Submission to LMS */}
+                      <button 
+                        onClick={() => setShowSubmitModal(true)} 
+                        className="w-full py-2.5 bg-purple-900 hover:bg-purple-800 text-white rounded-lg text-xs font-semibold shadow flex items-center justify-center space-x-2"
+                      >
+                        <i className="fa-solid fa-paper-plane"></i>
+                        <span>Submit to SCU LMS</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Right Column: Markdown Draft Editor */}
+                  <div className="lg:col-span-2 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm flex flex-col h-[650px]">
+                    <div className="flex items-center justify-between mb-3 pb-3 border-b border-slate-100">
+                      <div className="flex items-center space-x-2">
+                        <span className="font-bold text-sm text-slate-800">AI Assignment Solution</span>
+                        {draft?.is_student_approved && (
+                          <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 text-[10px] font-bold rounded">
+                            APPROVED
+                          </span>
+                        )}
+                      </div>
+                      {draft?.model_used && (
+                        <span className="text-[11px] text-slate-400">Model: {draft.model_used}</span>
+                      )}
+                    </div>
+
+                    {draft ? (
+                      <textarea 
+                        value={draft.draft_markdown}
+                        onChange={e => setDraft({ ...draft, draft_markdown: e.target.value })}
+                        className="flex-1 w-full p-4 font-mono text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-900 outline-none resize-none leading-relaxed"
+                        placeholder="Solution Markdown will appear here..."
+                      ></textarea>
+                    ) : (
+                      <div className="flex-1 flex flex-col items-center justify-center text-slate-400">
+                        <i className="fa-solid fa-file-pen text-4xl mb-2"></i>
+                        <p className="text-xs">No draft generated yet. Click "Generate with Gemini AI" to begin.</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* VIEW 4: AUDIT LOGS */}
+            {currentView === "audit" && (
+              <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm">
+                <h2 className="text-xl font-bold mb-4">Immutable Submission Audit Log</h2>
+                <p className="text-xs text-slate-500 mb-6">Chronological verification history and evidence records for your student account.</p>
+
+                {auditEvents.length === 0 ? (
+                  <p className="text-xs text-slate-400 py-8 text-center">No audit records recorded yet.</p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                        <tr>
+                          <th className="py-2.5 px-3">Timestamp</th>
+                          <th className="py-2.5 px-3">Event Type</th>
+                          <th className="py-2.5 px-3">Evidence Artifact</th>
+                          <th className="py-2.5 px-3">Details</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {auditEvents.map(ev => (
+                          <tr key={ev.id} className="hover:bg-slate-50">
+                            <td className="py-2.5 px-3 text-slate-500">{new Date(ev.created_at).toLocaleString()}</td>
+                            <td className="py-2.5 px-3 font-semibold text-blue-900">{ev.event_type}</td>
+                            <td className="py-2.5 px-3 font-mono text-slate-600 truncate max-w-xs">{ev.evidence_url || 'N/A'}</td>
+                            <td className="py-2.5 px-3 text-slate-500">{ev.event_details}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+
+          </main>
+
+          {/* MODAL 1: Mandatory Student Submission Approval Modal */}
+          {showSubmitModal && (
+            <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl">
+                <div className="w-12 h-12 bg-amber-100 text-amber-700 rounded-full flex items-center justify-center text-xl mx-auto mb-4">
+                  <i className="fa-solid fa-triangle-exclamation"></i>
+                </div>
+                <h3 className="text-lg font-bold text-center text-slate-800">Mandatory Submission Approval</h3>
+                <p className="text-xs text-slate-600 text-center mt-2 mb-4">
+                  You are about to initiate the automated upload of this solution to Seoul Christian University LMS.
+                </p>
+
+                <div className="bg-slate-50 p-3 rounded-lg text-xs space-y-1 mb-4 border border-slate-200">
+                  <div><strong>Course:</strong> {selectedAssignment.course_name}</div>
+                  <div><strong>Assignment:</strong> {selectedAssignment.assignment_title}</div>
+                  <div><strong>Mode:</strong> Safe Verification Mode (Captures proof screenshot)</div>
+                </div>
+
+                <div className="flex space-x-3">
+                  <button 
+                    onClick={() => setShowSubmitModal(false)}
+                    className="flex-1 py-2 border border-slate-300 rounded-lg text-xs font-semibold text-slate-600 hover:bg-slate-100"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    onClick={handleTriggerSubmitJob}
+                    className="flex-1 py-2 bg-blue-900 text-white rounded-lg text-xs font-semibold hover:bg-blue-800 shadow"
+                  >
+                    I Confirm & Submit
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* MODAL 2: Create Assignment Modal */}
+          {showNewAssignModal && (
+            <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+              <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl">
+                <h3 className="text-lg font-bold text-slate-800 mb-4">Create Assignment Entry</h3>
+                <form onSubmit={handleCreateAssignment} className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">COURSE NAME</label>
+                    <input 
+                      type="text" 
+                      required 
+                      value={newCourse} 
+                      onChange={e => setNewCourse(e.target.value)} 
+                      placeholder="e.g. Artificial Intelligence"
+                      className="w-full px-3 py-2 border rounded-lg text-xs focus:ring-2 focus:ring-blue-900 outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">ASSIGNMENT TITLE</label>
+                    <input 
+                      type="text" 
+                      required 
+                      value={newTitle} 
+                      onChange={e => setNewTitle(e.target.value)} 
+                      placeholder="e.g. Week 7: Machine Learning Report"
+                      className="w-full px-3 py-2 border rounded-lg text-xs focus:ring-2 focus:ring-blue-900 outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">INSTRUCTIONS / RAW NOTES</label>
+                    <textarea 
+                      rows="4"
+                      value={newInstructions} 
+                      onChange={e => setNewInstructions(e.target.value)} 
+                      placeholder="Paste instructions from SCU LMS here..."
+                      className="w-full px-3 py-2 border rounded-lg text-xs focus:ring-2 focus:ring-blue-900 outline-none"
+                    ></textarea>
+                  </div>
+                  <div className="flex space-x-3 pt-2">
+                    <button 
+                      type="button" 
+                      onClick={() => setShowNewAssignModal(false)}
+                      className="flex-1 py-2 border rounded-lg text-xs font-semibold text-slate-600"
+                    >
+                      Cancel
+                    </button>
+                    <button 
+                      type="submit" 
+                      className="flex-1 py-2 bg-blue-900 text-white rounded-lg text-xs font-semibold"
+                    >
+                      Create Assignment
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>

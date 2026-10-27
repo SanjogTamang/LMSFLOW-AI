@@ -1,3 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+jinja2
 google-genai
 python-dotenv
 playwright
+supabase
+reportlab
+pytest
+httpx
+cryptography

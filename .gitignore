@@ -1,9 +1,26 @@
+# Environment and Secrets
 .env
+*.env
+!.env.example
+
+# Python virtual environment
 venv/
 .venv/
+env/
 __pycache__/
 *.py[cod]
-logged_in.png
-fitst.py
-.vscode
+*$py.class
+*.pytest_cache/
 
+# Local generated artifacts and screenshots (Contain sensitive student portal DOM / PII)
+*.png
+*.pdf
+inspect_login.png
+test_after_enter.png
+assignment_output.pdf
+tempCodeRunnerFile.py
+
+# Editor & OS settings
+.vscode/
+.DS_Store
+Thumbs.db

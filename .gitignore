@@ -1,6 +1,7 @@
 # Environment and Secrets
 .env
 *.env
+*.db
 !.env.example
 
 # Python virtual environment

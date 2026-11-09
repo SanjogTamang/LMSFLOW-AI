@@ -1,0 +1,598 @@
+"""
+SCU LMS Read-Only Assignment Scanner Module
+===========================================
+This module performs read-only scanning of assignments on the Seoul Christian
+University (SCU) LMS portal (https://lms.scu.ac.kr/home).
+
+It logs in using student credentials, reads the Learning Activity (학습활동)
+section on the student's dashboard, visits each assignment's detail page, and
+extracts metadata, instructions, deadlines, attachments, and submission status.
+
+SAFETY GUARANTEE:
+- This module is STRICTLY READ-ONLY.
+- It does NOT submit assignments, upload files, click final submit buttons,
+  or modify any LMS data.
+"""
+
+import os
+import sys
+import json
+import re
+import functools
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Tuple
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PlaywrightTimeoutError
+
+# Ensure terminal stdout handles UTF-8 (Korean characters) on Windows
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+# Ensure immediate unbuffered console logging
+print = functools.partial(print, flush=True)
+
+# Load environment variables
+load_dotenv()
+
+BASE_URL = "https://lms.scu.ac.kr/home"
+LOGIN_PAGE_URL = "https://lms.scu.ac.kr/home/mainHome/Form/main"
+MY_PAGE_URL = "https://lms.scu.ac.kr/home/mainHome/Form/myPage"
+
+
+def parse_korean_datetime(dt_str: Optional[str]) -> Optional[datetime]:
+    """
+    Parses date strings commonly found in SCU LMS into datetime objects.
+    Examples:
+      - '2026.11.15(23:59)'
+      - '2026-11-15 23:59'
+      - '2026.11.15'
+    Returns None if dt_str is None or contains no valid date digits (e.g. '비허용').
+    """
+    if not dt_str:
+        return None
+    
+    # Match YYYY.MM.DD(HH:MM) or YYYY-MM-DD HH:MM
+    match = re.search(r'(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})(?:[^\d]*(\d{1,2}):(\d{2}))?', dt_str.strip())
+    if match:
+        year, month, day, hour, minute = match.groups()
+        h = int(hour) if hour is not None else 23
+        m = int(minute) if minute is not None else 59
+        try:
+            return datetime(int(year), int(month), int(day), h, m)
+        except ValueError:
+            return None
+    return None
+
+
+def parse_date_range(period_str: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Parses a period string like:
+    '2026.11.09(10:00) ~ 2026.11.15(23:59)'
+    Returns (start_date_str, deadline_str).
+    """
+    if not period_str or "~" not in period_str:
+        return None, period_str.strip() if period_str else None
+    
+    parts = period_str.split("~")
+    start_str = parts[0].strip()
+    end_str = parts[1].strip() if len(parts) > 1 else None
+    return start_str, end_str
+
+
+def classify_submission_status(
+    deadline_str: Optional[str],
+    submission_info_text: str,
+    current_time: Optional[datetime] = None
+) -> str:
+    """
+    Classifies the assignment submission status into one of:
+      - 'Pending': No submission has been registered and the deadline has not passed.
+      - 'Submitted': The LMS clearly confirms a submission.
+      - 'Overdue': The deadline has passed and no submission has been registered.
+      - 'Unknown': The LMS does not provide enough information to determine the status.
+
+    Rules:
+      1. If submission text indicates no submission (e.g. '등록된 제출 정보가 없습니다'):
+         - If deadline has passed -> 'Overdue'
+         - If deadline is in the future -> 'Pending'
+         - If deadline cannot be parsed -> 'Unknown'
+      2. If submission text shows confirmed submission record -> 'Submitted'
+      3. Otherwise -> 'Unknown'
+    """
+    if current_time is None:
+        current_time = datetime.now()
+
+    text = submission_info_text.strip() if submission_info_text else ""
+
+    # Indicators that no submission exists yet
+    no_submission_markers = [
+        "등록된 제출 정보가 없습니다",
+        "미제출",
+        "제출된 과제가 없습니다",
+        "제출 내역이 없습니다",
+    ]
+
+    # Indicators that assignment has been submitted
+    submitted_markers = [
+        "제출완료",
+        "제출일시",
+        "제출내용",
+        "제출파일",
+        "제출일자",
+    ]
+
+    is_unsubmitted = any(marker in text for marker in no_submission_markers)
+    has_submission = any(marker in text for marker in submitted_markers) and not is_unsubmitted
+
+    deadline_dt = parse_korean_datetime(deadline_str) if deadline_str else None
+
+    if is_unsubmitted:
+        if deadline_dt:
+            if current_time > deadline_dt:
+                return "Overdue"
+            else:
+                return "Pending"
+        else:
+            return "Pending"
+
+    if has_submission:
+        return "Submitted"
+
+    # Fallback checks if neither explicit marker matched
+    if deadline_dt:
+        if current_time > deadline_dt:
+            return "Overdue"
+        else:
+            return "Pending"
+
+    return "Unknown"
+
+
+def login_to_lms(page: Page, username: Optional[str] = None, password: Optional[str] = None) -> bool:
+    """
+    Navigates to SCU LMS and logs in using student credentials.
+    Credentials default to LMS_USERNAME and LMS_PASSWORD in .env if not supplied.
+    Returns True if login succeeds, False otherwise.
+    """
+    user = username or os.getenv("LMS_USERNAME")
+    pwd = password or os.getenv("LMS_PASSWORD")
+
+    if not user or not pwd:
+        raise ValueError("LMS credentials missing! Please set LMS_USERNAME and LMS_PASSWORD in .env.")
+
+    print(f"[INFO] Opening SCU LMS website ({BASE_URL})...")
+    try:
+        page.goto(BASE_URL, wait_until="networkidle", timeout=15000)
+    except Exception as nav_err:
+        print(f"[INFO] Initial navigation notice: {nav_err}")
+
+    # Check if already authenticated
+    if "myPage" in page.url:
+        print("[INFO] Already authenticated on LMS.")
+        return True
+
+    # If base URL returned an error page or does not contain login fields, navigate to Form/main
+    has_login_fields = (
+        page.locator("input[name='id']").count() > 0 or 
+        page.locator("input[name='password']").count() > 0
+    )
+    if not has_login_fields:
+        print(f"[INFO] Navigating to LMS login form ({LOGIN_PAGE_URL})...")
+        page.goto(LOGIN_PAGE_URL, wait_until="networkidle", timeout=20000)
+
+    # Enter student credentials
+    print("[INFO] Entering student login credentials...")
+    try:
+        page.wait_for_selector("input[name='id']", timeout=10000)
+        page.fill("input[name='id']", user)
+        page.fill("input[name='password']", pwd)
+        page.keyboard.press("Enter")
+    except PlaywrightTimeoutError:
+        # Fallback selectors
+        try:
+            user_input = page.locator("input#usr_id, input#id, input[name='usr_id']").first
+            pwd_input = page.locator("input#usr_pwd, input#pwd, input[name='password']").first
+            user_input.fill(user)
+            pwd_input.fill(pwd)
+            page.keyboard.press("Enter")
+        except Exception as e:
+            print(f"[ERROR] Failed to locate login input fields: {e}")
+            page.screenshot(path="login_error.png")
+            return False
+
+    # Wait for redirect to student myPage
+    print("[INFO] Waiting for authentication response...")
+    try:
+        page.wait_for_url("**/Form/myPage*", timeout=20000)
+        print("[SUCCESS] Successfully logged into SCU LMS.")
+        return True
+    except PlaywrightTimeoutError:
+        page.wait_for_timeout(3000)
+        curr_url = page.url
+        if "myPage" in curr_url or page.locator("#lecActListMyPage").count() > 0:
+            print("[SUCCESS] Successfully logged in.")
+            return True
+        print(f"[ERROR] Login failed or unexpected destination: {curr_url}")
+        page.screenshot(path="login_failed.png")
+        return False
+
+
+def navigate_to_learning_activity(page: Page) -> bool:
+    """
+    Ensures the browser is on the student's My Page (myPage) where the
+    Learning Activity (학습활동) list container (#lecActListMyPage) is located.
+    """
+    if "myPage" not in page.url:
+        print("[INFO] Navigating to My Page...")
+        page.goto(MY_PAGE_URL, wait_until="networkidle", timeout=20000)
+
+    try:
+        print("[INFO] Waiting for Learning Activity section (#lecActListMyPage)...")
+        page.wait_for_selector("#lecActListMyPage", timeout=15000)
+        return True
+    except PlaywrightTimeoutError:
+        print("[WARNING] Could not find #lecActListMyPage directly.")
+        return False
+
+
+def extract_assignment_links(page: Page) -> List[Dict[str, Any]]:
+    """
+    Extracts all assignment entries from the Learning Activity (학습활동) section
+    on the student's dashboard.
+    Returns a list of assignment metadata dictionaries.
+    """
+    soup = BeautifulSoup(page.content(), "html.parser")
+    activity_box = soup.select_one("#lecActListMyPage")
+    if not activity_box:
+        print("[WARNING] Learning activity container #lecActListMyPage not found.")
+        return []
+
+    items = activity_box.select("blockquote")
+    assignments: List[Dict[str, Any]] = []
+
+    for item in items:
+        link_elem = item.select_one("a.link")
+        if not link_elem:
+            continue
+
+        link_text = link_elem.get_text(strip=True)
+        href = link_elem.get("href", "")
+
+        # Check if this is an assignment activity
+        is_asmnt = "[과제]" in link_text or "[Team 과제]" in link_text or "goToDetail('ASMNT'" in href or "goToDetail(\"ASMNT\"" in href
+        if not is_asmnt:
+            continue
+
+        # Extract course name: in SCU LMS blockquote, ul.info-box li[0] is the course name
+        info_box = item.select_one("ul.info-box")
+        course_name = "알 수 없음"
+        date_range_str = None
+
+        if info_box:
+            lis = info_box.select("li")
+            if lis:
+                course_name = lis[0].get_text(strip=True)
+            for li in lis:
+                txt = li.get_text(strip=True)
+                if "~" in txt or re.search(r"\d{4}\.\d{2}\.\d{2}", txt):
+                    date_range_str = txt
+
+        # Clean title by removing activity tag prefix like [과제]
+        clean_title = re.sub(r"^\[.*?\]\s*", "", link_text).strip()
+
+        # Extract javascript navigation parameters: goToDetail('ASMNT', 'crsCreCd', 'asmntCd')
+        match = re.search(r"goToDetail\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"]", href)
+        crs_cre_cd = match.group(2) if match else None
+        asmnt_cd = match.group(3) if match else None
+
+        assignments.append({
+            "course_name": course_name,
+            "raw_title": link_text,
+            "title": clean_title,
+            "date_range_card": date_range_str,
+            "crs_cre_cd": crs_cre_cd,
+            "asmnt_cd": asmnt_cd,
+            "href": href,
+        })
+
+    print(f"[INFO] Found {len(assignments)} assignment(s) in Learning Activity.")
+    return assignments
+
+
+def extract_assignment_details(page: Page, assignment_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Opens an assignment's detail page (READ-ONLY), extracts complete details,
+    and returns to the My Page view.
+    """
+    crs_cre_cd = assignment_meta.get("crs_cre_cd")
+    asmnt_cd = assignment_meta.get("asmnt_cd")
+    title = assignment_meta.get("title")
+    course_name = assignment_meta.get("course_name")
+
+    print(f"[INFO] Scanning assignment: [{course_name}] {title}...")
+
+    # Navigate to detail page using LMS's client-side goToDetail function
+    try:
+        page.evaluate(
+            "([crs, asmnt]) => goToDetail('ASMNT', crs, asmnt)",
+            [crs_cre_cd, asmnt_cd]
+        )
+        page.wait_for_selector("h2.page-title", timeout=15000)
+        # Wait for dynamic #rightDiv to load submission status via AJAX
+        try:
+            page.wait_for_selector("#rightDiv .ui, #rightDiv a, #rightDiv p, #rightDiv button", timeout=4000)
+        except Exception:
+            page.wait_for_timeout(1500)
+    except Exception as e:
+        print(f"[WARNING] Failed to open detail page via goToDetail for {title}: {e}")
+        return {
+            **assignment_meta,
+            "error": str(e),
+            "status": "Unknown",
+        }
+
+    detail_html = page.content()
+    detail_url = page.url
+    soup = BeautifulSoup(detail_html, "html.parser")
+
+    # 1. Page Title
+    title_elem = soup.select_one("h2.page-title")
+    detail_title = title_elem.get_text(strip=True) if title_elem else title
+    # Clean possible prefix like "과제 : "
+    detail_title = re.sub(r"^(과제|과제\s*명|과제명)\s*[:\-]\s*", "", detail_title).strip()
+
+    # 2. Extract Fields (제출기간, 연장제출마감일, 제출형식, 과제유형, etc.)
+    field_data: Dict[str, str] = {}
+    for field in soup.select("div.inline.field"):
+        label = field.select_one("label.label-title")
+        if label:
+            label_text = label.get_text(strip=True)
+            label.decompose()
+            val_text = field.get_text(" ", strip=True)
+            field_data[label_text] = val_text
+
+    # Extract specific values
+    submission_period = field_data.get("제출기간", assignment_meta.get("date_range_card") or "")
+    extended_deadline_raw = field_data.get("연장제출마감일", "").strip()
+    submission_format = field_data.get("제출형식", "파일")
+    assignment_type = field_data.get("과제유형", "개인과제")
+
+    start_date, original_deadline = parse_date_range(submission_period)
+
+    # Only treat extended deadline as effective deadline if it actually contains a date/time (not "비허용")
+    if extended_deadline_raw and re.search(r"\d{4}", extended_deadline_raw):
+        effective_deadline = extended_deadline_raw
+        extended_deadline = extended_deadline_raw
+    else:
+        effective_deadline = original_deadline
+        extended_deadline = extended_deadline_raw if extended_deadline_raw and extended_deadline_raw != "비허용" else "비허용"
+
+    # 3. Assignment Instructions (과제 설명 / 내용)
+    instructions = ""
+    content_editor = soup.select_one(".note-editable")
+    if content_editor:
+        instructions = content_editor.get_text("\n", strip=True)
+    else:
+        for f in soup.select("div.field"):
+            label = f.select_one("label.label-title")
+            if label and "과제내용" in label.get_text(strip=True):
+                label.decompose()
+                instructions = f.get_text("\n", strip=True)
+                break
+
+    # 4. Attachments (첨부파일)
+    attachments: List[Dict[str, str]] = []
+    seen_urls = set()
+    candidate_links = soup.select("ul.file-list a, div.attached-file a, .note-editable a, div.field a")
+    file_extensions = (".pdf", ".docx", ".doc", ".hwp", ".hwpx", ".zip", ".ipynb", ".txt", ".pptx", ".xlsx")
+
+    for link in candidate_links:
+        att_name = link.get_text(strip=True)
+        att_href = link.get("href", "")
+        is_file = (
+            "pdfView" in att_href or
+            "download" in att_href.lower() or
+            "file" in att_href.lower() or
+            any(att_name.lower().endswith(ext) for ext in file_extensions)
+        )
+        if is_file and att_name:
+            if any(skip in att_name for skip in ["전체다운로드", "목록", "프로필"]):
+                continue
+            if att_href and att_href not in seen_urls:
+                seen_urls.add(att_href)
+                url_val = att_href if (att_href.startswith("http") or att_href.startswith("javascript")) else f"https://lms.scu.ac.kr{att_href}"
+                attachments.append({
+                    "name": att_name,
+                    "url": url_val
+                })
+
+    # 5. Submission Status (제출현황)
+    right_elem = soup.select_one("#rightDiv")
+    if right_elem:
+        for s in right_elem.select("script"):
+            s.decompose()
+        right_text = right_elem.get_text(" ", strip=True)
+    else:
+        right_text = ""
+
+    unsubmitted_marker = ("등록된 제출 정보가 없습니다" in right_text) or ("등록된 제출 정보가 없습니다" in detail_html)
+
+    if unsubmitted_marker:
+        submission_status_text = "등록된 제출 정보가 없습니다."
+    elif right_text:
+        submission_status_text = right_text
+    else:
+        submission_status_text = "제출 정보 없음"
+
+    status = classify_submission_status(effective_deadline, submission_status_text)
+
+    # 6. Return back to My Page so the next assignment can be processed
+    try:
+        page.goto(MY_PAGE_URL, wait_until="networkidle", timeout=15000)
+        page.wait_for_selector("#lecActListMyPage", timeout=10000)
+    except Exception as e:
+        print(f"[WARNING] Return to My Page was delayed: {e}")
+
+    return {
+        "course_name": course_name,
+        "assignment_title": detail_title or title,
+        "assignment_url": detail_url,
+        "assignment_type": assignment_type,
+        "start_date": start_date,
+        "deadline": effective_deadline,
+        "original_deadline": original_deadline,
+        "extended_deadline": extended_deadline,
+        "submission_format": submission_format,
+        "instructions": instructions,
+        "attachments": attachments,
+        "submission_status_text": submission_status_text,
+        "status": status,
+        "crs_cre_cd": crs_cre_cd,
+        "asmnt_cd": asmnt_cd,
+    }
+
+
+def scan_assignments(
+    headless: bool = True,
+    screenshot_on_fail: bool = True,
+    username: Optional[str] = None,
+    password: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Main orchestration function:
+      1. Launches Playwright browser.
+      2. Authenticates with SCU LMS.
+      3. Extracts assignment links from Learning Activity.
+      4. Inspects each assignment detail page (READ-ONLY).
+      5. Returns the structured list of assignments.
+    """
+    scanned_results: List[Dict[str, Any]] = []
+
+    with sync_playwright() as p:
+        print(f"[INFO] Launching Chromium browser (headless={headless})...")
+        browser: Browser = p.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+        page: Page = context.new_page()
+
+        try:
+            # Step 1: Login
+            login_success = login_to_lms(page, username=username, password=password)
+            if not login_success:
+                raise RuntimeError("Failed to log in to SCU LMS.")
+
+            # Step 2: Navigate to Learning Activity
+            ready = navigate_to_learning_activity(page)
+            if not ready:
+                raise RuntimeError("Failed to load Learning Activity container on My Page.")
+
+            # Step 3: Extract Assignment Links
+            links = extract_assignment_links(page)
+            if not links:
+                print("[INFO] No assignments currently found in Learning Activity.")
+                return []
+
+            # Step 4: Scan Details for Each Assignment
+            for index, meta in enumerate(links, 1):
+                print(f"\n[SCAN {index}/{len(links)}] Processing: [{meta.get('course_name')}] {meta.get('title')}")
+                detail = extract_assignment_details(page, meta)
+                scanned_results.append(detail)
+
+        except Exception as err:
+            print(f"[ERROR] Exception during assignment scanning: {err}")
+            if screenshot_on_fail:
+                fail_path = f"scan_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                try:
+                    page.screenshot(path=fail_path)
+                    print(f"[INFO] Error screenshot saved to {fail_path}")
+                except Exception:
+                    pass
+            raise err
+        finally:
+            print("\n[INFO] Closing browser session...")
+            browser.close()
+
+    return scanned_results
+
+
+def save_assignments(assignments: List[Dict[str, Any]], output_path: str = "assignments.json") -> str:
+    """
+    Saves scanned assignments to a structured JSON file with UTF-8 encoding,
+    preserving original Korean text and adding scan metadata.
+    """
+    counts = {
+        "Pending": 0,
+        "Submitted": 0,
+        "Overdue": 0,
+        "Unknown": 0,
+    }
+    for a in assignments:
+        st = a.get("status", "Unknown")
+        counts[st] = counts.get(st, 0) + 1
+
+    payload = {
+        "scan_timestamp": datetime.now().isoformat(),
+        "total_assignments": len(assignments),
+        "summary": counts,
+        "assignments": assignments,
+    }
+
+    resolved_path = Path(output_path).resolve()
+    with open(resolved_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    print(f"[SUCCESS] Scanned assignments saved to {resolved_path}")
+    return str(resolved_path)
+
+
+def print_summary_table(assignments: List[Dict[str, Any]]) -> None:
+    """
+    Prints a clean, formatted terminal summary table of scanned assignments.
+    """
+    print("\n" + "=" * 115)
+    print(f"{'#':<3} | {'상태 (Status)':<11} | {'형식':<6} | {'과목명 (Course)':<22} | {'과제명 (Assignment)':<32} | {'마감일 (Deadline)':<22}")
+    print("-" * 115)
+
+    status_icons = {
+        "Pending": "[Pending]  ",
+        "Submitted": "[Submitted]",
+        "Overdue": "[Overdue]  ",
+        "Unknown": "[Unknown]  ",
+    }
+
+    for idx, a in enumerate(assignments, 1):
+        status = a.get("status", "Unknown")
+        status_disp = status_icons.get(status, f"[{status}]")
+        fmt = (a.get("submission_format") or "파일")[:4]
+        course = (a.get("course_name") or "")[:20]
+        title = (a.get("assignment_title") or "")[:30]
+        deadline = a.get("deadline") or "마감일 미지정"
+        print(f"{idx:<3} | {status_disp:<11} | {fmt:<6} | {course:<22} | {title:<32} | {deadline:<22}")
+
+    print("=" * 115 + "\n")
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("SCU LMS READ-ONLY ASSIGNMENT SCANNER")
+    print("=" * 60)
+
+    try:
+        results = scan_assignments(headless=True)
+        print_summary_table(results)
+        save_assignments(results, "assignments.json")
+        print("[COMPLETE] Scanner finished successfully.")
+    except Exception as e:
+        print(f"\n[FATAL] Scanner encountered an error: {e}")
+        sys.exit(1)

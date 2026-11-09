@@ -5,8 +5,10 @@ jinja2
 google-genai
 python-dotenv
 playwright
-supabase
+supabase>=2.20,<3
 reportlab
 pytest
 httpx
 cryptography
+email-validator
+beautifulsoup4

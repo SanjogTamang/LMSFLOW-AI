@@ -67,8 +67,6 @@
       const authHeaders = {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${token}`,
-        "X-User-Id": user?.id || "",
-        "X-User-Email": user?.email || ""
       };
 
       // ── Effect: Load profile and initial data on login ──

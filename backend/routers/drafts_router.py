@@ -1,148 +1,86 @@
-import uuid
 import datetime
+import uuid
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends, status
-from backend.models import GenerateDraftRequest, UpdateDraftRequest, DraftResponse
-from backend.database import local_store
-from backend.security import get_current_user, AuthenticatedUser
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from backend.database import get_database
+from backend.models import DraftResponse, GenerateDraftRequest, UpdateDraftRequest
+from backend.security import AuthenticatedUser, get_current_user
 from backend.services.gemini_service import generate_assignment_solution
 
 router = APIRouter(prefix="/api/assignments", tags=["Assignment Drafts"])
 
-@router.post("/{assignment_id}/generate-draft", response_model=DraftResponse)
-def create_ai_draft(
-    assignment_id: str,
-    req: GenerateDraftRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user)
-):
-    """Generates an academic solution draft using Gemini AI for the student's assignment."""
-    with local_store.get_conn() as conn:
-        assignment = conn.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone()
-
-    if not assignment:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assignment not found.")
-
-    if assignment["user_id"] != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: You do not own this assignment.")
-
-    # Call Gemini AI
-    solution_md, model_name = generate_assignment_solution(
-        course_name=assignment["course_name"],
-        assignment_title=assignment["assignment_title"],
-        instructions=assignment["instructions"] or "",
-        student_notes=req.custom_instructions
-    )
-
-    draft_id = str(uuid.uuid4())
-    now_str = datetime.datetime.now().isoformat()
-
-    with local_store.get_conn() as conn:
-        conn.execute("""
-            INSERT INTO assignment_drafts (id, user_id, assignment_id, model_used, draft_title, draft_markdown, is_student_approved, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-        """, (draft_id, current_user.id, assignment_id, model_name, assignment["assignment_title"], solution_md, now_str))
-        conn.execute("UPDATE assignments SET current_status = 'draft_generated' WHERE id = ?", (assignment_id,))
-        conn.commit()
-
+def _draft(row: dict) -> DraftResponse:
     return DraftResponse(
-        id=draft_id,
-        user_id=current_user.id,
-        assignment_id=assignment_id,
-        model_used=model_name,
-        draft_title=assignment["assignment_title"],
-        draft_markdown=solution_md,
-        is_student_approved=False,
-        created_at=now_str
+        id=row["id"], user_id=row["user_id"], assignment_id=row["assignment_id"],
+        model_used=row["model_used"], draft_title=row.get("draft_title"), draft_markdown=row["draft_markdown"],
+        is_student_approved=bool(row.get("is_student_approved", False)), approved_at=row.get("approved_at"),
+        created_at=row.get("created_at"),
     )
+
+
+def _owned_assignment(db, assignment_id: str, user_id: str):
+    row = db.select("assignments", {"id": assignment_id, "user_id": user_id}, single=True)
+    if not row:
+        raise HTTPException(404, "Assignment not found")
+    return row
+
+
+def _latest_draft(db, assignment_id: str, user_id: str):
+    rows = db.select("assignment_drafts", {"assignment_id": assignment_id, "user_id": user_id})
+    return max(rows, key=lambda row: row.get("created_at") or "", default=None)
+
+
+@router.post("/{assignment_id}/generate-draft", response_model=DraftResponse)
+def create_ai_draft(assignment_id: str, req: GenerateDraftRequest, current_user: AuthenticatedUser = Depends(get_current_user)):
+    db = get_database()
+    assignment = _owned_assignment(db, assignment_id, current_user.id)
+    solution_md, model_name = generate_assignment_solution(
+        course_name=assignment["course_name"], assignment_title=assignment["assignment_title"],
+        instructions=assignment.get("instructions") or "", student_notes=req.custom_instructions,
+    )
+    row = db.insert("assignment_drafts", {
+        "id": str(uuid.uuid4()), "user_id": current_user.id, "assignment_id": assignment_id,
+        "model_used": model_name, "draft_title": assignment["assignment_title"], "draft_markdown": solution_md,
+        "is_student_approved": False,
+    })
+    db.update("assignments", {"id": assignment_id, "user_id": current_user.id}, {"current_status": "draft_generated"})
+    return _draft(row)
+
 
 @router.get("/{assignment_id}/draft", response_model=Optional[DraftResponse])
 def get_latest_draft(assignment_id: str, current_user: AuthenticatedUser = Depends(get_current_user)):
-    """Retrieves the latest draft for this assignment."""
-    with local_store.get_conn() as conn:
-        assignment = conn.execute("SELECT user_id FROM assignments WHERE id = ?", (assignment_id,)).fetchone()
-        if not assignment:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assignment not found.")
-        if assignment["user_id"] != current_user.id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+    db = get_database()
+    _owned_assignment(db, assignment_id, current_user.id)
+    row = _latest_draft(db, assignment_id, current_user.id)
+    return _draft(row) if row else None
 
-        draft = conn.execute("""
-            SELECT * FROM assignment_drafts
-            WHERE assignment_id = ? AND user_id = ?
-            ORDER BY created_at DESC LIMIT 1
-        """, (assignment_id, current_user.id)).fetchone()
-
-    if not draft:
-        return None
-
-    return DraftResponse(
-        id=draft["id"],
-        user_id=draft["user_id"],
-        assignment_id=draft["assignment_id"],
-        model_used=draft["model_used"],
-        draft_title=draft["draft_title"],
-        draft_markdown=draft["draft_markdown"],
-        is_student_approved=bool(draft["is_student_approved"]),
-        approved_at=draft["approved_at"],
-        created_at=draft["created_at"]
-    )
 
 @router.put("/{assignment_id}/draft", response_model=DraftResponse)
-def update_draft(
-    assignment_id: str,
-    req: UpdateDraftRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user)
-):
-    """Allows the student to review, refine, and edit their AI draft."""
-    with local_store.get_conn() as conn:
-        draft = conn.execute("""
-            SELECT * FROM assignment_drafts
-            WHERE assignment_id = ? AND user_id = ?
-            ORDER BY created_at DESC LIMIT 1
-        """, (assignment_id, current_user.id)).fetchone()
+def update_draft(assignment_id: str, req: UpdateDraftRequest, current_user: AuthenticatedUser = Depends(get_current_user)):
+    db = get_database()
+    draft = _latest_draft(db, assignment_id, current_user.id)
+    if not draft:
+        raise HTTPException(404, "No existing draft to update")
+    values = {"draft_markdown": req.draft_markdown}
+    if req.draft_title is not None:
+        values["draft_title"] = req.draft_title
+    db.update("assignment_drafts", {"id": draft["id"], "user_id": current_user.id}, values)
+    updated = db.select("assignment_drafts", {"id": draft["id"], "user_id": current_user.id}, single=True)
+    return _draft(updated)
 
-        if not draft:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No existing draft to update.")
-
-        conn.execute("""
-            UPDATE assignment_drafts
-            SET draft_markdown = ?, draft_title = COALESCE(?, draft_title)
-            WHERE id = ?
-        """, (req.draft_markdown, req.draft_title, draft["id"]))
-        conn.commit()
-
-        updated = conn.execute("SELECT * FROM assignment_drafts WHERE id = ?", (draft["id"],)).fetchone()
-
-    return DraftResponse(
-        id=updated["id"],
-        user_id=updated["user_id"],
-        assignment_id=updated["assignment_id"],
-        model_used=updated["model_used"],
-        draft_title=updated["draft_title"],
-        draft_markdown=updated["draft_markdown"],
-        is_student_approved=bool(updated["is_student_approved"]),
-        approved_at=updated["approved_at"],
-        created_at=updated["created_at"]
-    )
 
 @router.post("/{assignment_id}/approve")
 def approve_draft(assignment_id: str, current_user: AuthenticatedUser = Depends(get_current_user)):
-    """Student marks draft as approved for PDF generation & LMS submission."""
-    now_str = datetime.datetime.now().isoformat()
-    with local_store.get_conn() as conn:
-        draft = conn.execute("""
-            SELECT id FROM assignment_drafts
-            WHERE assignment_id = ? AND user_id = ?
-            ORDER BY created_at DESC LIMIT 1
-        """, (assignment_id, current_user.id)).fetchone()
-
-        if not draft:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No draft found to approve.")
-
-        conn.execute("""
-            UPDATE assignment_drafts SET is_student_approved = 1, approved_at = ? WHERE id = ?
-        """, (now_str, draft["id"]))
-        conn.execute("UPDATE assignments SET current_status = 'approved' WHERE id = ?", (assignment_id,))
-        conn.commit()
-
-    return {"message": "Draft approved by student.", "approved_at": now_str}
+    db = get_database()
+    draft = _latest_draft(db, assignment_id, current_user.id)
+    if not draft:
+        raise HTTPException(404, "No draft found to approve")
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    db.update("assignment_drafts", {"id": draft["id"], "user_id": current_user.id}, {
+        "is_student_approved": True, "approved_at": now,
+    })
+    db.update("assignments", {"id": assignment_id, "user_id": current_user.id}, {"current_status": "approved"})
+    return {"message": "Draft approved by student.", "approved_at": now}
 

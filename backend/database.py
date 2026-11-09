@@ -1,146 +1,130 @@
-import os
-import sqlite3
-from typing import Optional, Dict, Any, List
-from supabase import create_client, Client
+from typing import Any, Dict, List, Optional
+
+from supabase import Client, create_client
+
 from backend.config import settings
 
-class LocalFallbackStore:
+
+class SupabaseDataError(RuntimeError):
+    pass
+
+
+class SupabaseDatabase:
+    """Service-role database adapter for server operations.
+
+    Service-role access intentionally bypasses RLS. Every public operation
+    therefore requires an explicit user_id filter for tenant-owned tables.
+    This is enforced on mutation helpers to avoid accidentally leaking data.
     """
-    SQLite-backed local fallback store used for local development,
-    automated testing, or before Supabase remote tables are migrated.
-    Guarantees strict multi-tenant isolation by user_id.
-    """
-    def __init__(self, db_path: str = "storage/local_store.db"):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.db_path = db_path
-        self._init_db()
 
-    def get_conn(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    USER_SCOPED_TABLES = {
+        "profiles", "student_lms_connections", "courses", "assignments",
+        "assignment_drafts", "generated_documents", "submission_jobs",
+        "submission_events",
+    }
 
-    def _init_db(self):
-        with self.get_conn() as conn:
-            c = conn.cursor()
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS profiles (
-                id TEXT PRIMARY KEY,
-                email TEXT UNIQUE NOT NULL,
-                full_name TEXT,
-                scu_student_id TEXT,
-                is_scu_verified INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    def __init__(self, url: str, service_role_key: str):
+        if not url or not service_role_key:
+            raise SupabaseDataError(
+                "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server database access"
             )
-            """)
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS student_lms_connections (
-                id TEXT PRIMARY KEY,
-                user_id TEXT UNIQUE NOT NULL,
-                lms_student_id TEXT NOT NULL,
-                encrypted_lms_password TEXT NOT NULL,
-                connection_status TEXT DEFAULT 'disconnected',
-                last_verified_at TIMESTAMP,
-                last_error_message TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """)
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS assignments (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                course_id TEXT,
-                course_name TEXT NOT NULL,
-                assignment_title TEXT NOT NULL,
-                instructions TEXT,
-                due_date TIMESTAMP,
-                submission_format TEXT DEFAULT 'pdf',
-                lms_assignment_url TEXT,
-                current_status TEXT DEFAULT 'discovered',
-                source TEXT NOT NULL DEFAULT 'manual',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """)
-            assignment_columns = {
-                row["name"] for row in c.execute("PRAGMA table_info(assignments)").fetchall()
-            }
-            if "source" not in assignment_columns:
-                c.execute(
-                    "ALTER TABLE assignments ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'"
+        self.client: Client = create_client(url, service_role_key)
+
+    @staticmethod
+    def _raise(result: Any) -> Any:
+        error = getattr(result, "error", None)
+        if error:
+            raise SupabaseDataError(str(error))
+        return result
+
+    def select(
+        self,
+        table: str,
+        filters: Optional[Dict[str, Any]] = None,
+        columns: str = "*",
+        single: bool = False,
+        order_by: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        filters = filters or {}
+        self._validate_scope(table, filters)
+        query = self.client.table(table).select(columns)
+        for column, value in filters.items():
+            query = query.eq(column, value)
+        if order_by:
+            query = query.order(order_by)
+        if limit:
+            query = query.limit(limit)
+        result = self._raise(query.execute())
+        data = result.data or []
+        if single:
+            if len(data) > 1:
+                raise SupabaseDataError(f"select on {table} returned multiple rows")
+            return data[0] if data else None
+        return data
+
+    def insert(self, table: str, values: Dict[str, Any]) -> Dict[str, Any]:
+        self._validate_scope(table, values)
+        result = self._raise(
+            self.client.table(table).insert(values).execute()
+        )
+        if not result.data:
+            raise SupabaseDataError(f"insert into {table} returned no row")
+        return result.data[0]
+
+    def update(
+        self,
+        table: str,
+        filters: Dict[str, Any],
+        values: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        self._validate_scope(table, filters)
+        query = self.client.table(table).update(values)
+        for column, value in filters.items():
+            query = query.eq(column, value)
+        result = self._raise(query.execute())
+        return result.data or []
+
+    def delete(self, table: str, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        self._validate_scope(table, filters)
+        query = self.client.table(table).delete()
+        for column, value in filters.items():
+            query = query.eq(column, value)
+        return self._raise(query.execute()).data or []
+
+    def upsert(self, table: str, values: Dict[str, Any]) -> Dict[str, Any]:
+        self._validate_scope(table, values)
+        result = self._raise(
+            self.client.table(table).upsert(values).execute()
+        )
+        if not result.data:
+            raise SupabaseDataError(f"upsert into {table} returned no row")
+        return result.data[0]
+
+    def _validate_scope(self, table: str, values: Dict[str, Any]) -> None:
+        if table == "profiles":
+            if not ({"id", "email", "scu_student_id"} & values.keys()):
+                raise SupabaseDataError(
+                    "profiles operations require an explicit id, email, or scu_student_id"
                 )
-            c.execute("""
-                UPDATE assignments
-                SET source = 'legacy_demo'
-                WHERE (
-                    assignment_title LIKE 'Recent Assignment: %'
-                    AND instructions LIKE 'Extracted from SCU LMS course portal for %'
-                ) OR (
-                    course_name = 'Database Systems & Engineering'
-                    AND assignment_title = 'SQL Query Optimization and Normalization'
-                    AND instructions = 'Implement Relational 3NF schemas, write 3 aggregate queries with JOIN, and optimize query latency.'
-                )
-            """)
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS assignment_drafts (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                assignment_id TEXT NOT NULL,
-                model_used TEXT NOT NULL,
-                draft_title TEXT,
-                draft_markdown TEXT NOT NULL,
-                is_student_approved INTEGER DEFAULT 0,
-                approved_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        elif table in self.USER_SCOPED_TABLES and "user_id" not in values:
+            raise SupabaseDataError(
+                f"{table} operations require an explicit user_id filter"
             )
-            """)
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS generated_documents (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                assignment_id TEXT NOT NULL,
-                draft_id TEXT,
-                filename TEXT NOT NULL,
-                storage_path TEXT NOT NULL,
-                file_size_bytes INTEGER,
-                mime_type TEXT DEFAULT 'application/pdf',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """)
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS submission_jobs (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                assignment_id TEXT NOT NULL,
-                job_type TEXT NOT NULL,
-                status TEXT DEFAULT 'pending',
-                progress_percentage INTEGER DEFAULT 0,
-                current_step TEXT,
-                error_message TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """)
-            c.execute("""
-            CREATE TABLE IF NOT EXISTS submission_events (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                assignment_id TEXT,
-                job_id TEXT,
-                event_type TEXT NOT NULL,
-                evidence_url TEXT,
-                event_details TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """)
-            conn.commit()
 
-local_store = LocalFallbackStore()
+
+_database: Optional[SupabaseDatabase] = None
+
+
+def get_database() -> SupabaseDatabase:
+    global _database
+    if _database is None:
+        _database = SupabaseDatabase(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+    return _database
+
 
 def get_supabase_client() -> Optional[Client]:
-    """Returns initialized Supabase client if configured."""
-    if settings.SUPABASE_URL and settings.SUPABASE_KEY and "your-project" not in settings.SUPABASE_URL:
-        try:
-            return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
-        except Exception:
-            return None
-    return None
+    """Public-anon client for browser-facing Auth calls and token checks."""
+    if not settings.SUPABASE_URL or not settings.SUPABASE_KEY:
+        return None
+    return create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)

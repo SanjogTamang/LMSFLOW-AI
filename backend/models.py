@@ -4,7 +4,7 @@ from pydantic import BaseModel, EmailStr, Field
 # ── User & Auth Models ────────────────────────────────────────────────────────
 class RegisterRequest(BaseModel):
     student_id: str = Field(..., min_length=4, description="SCU Student ID number, e.g. 20240301001")
-    password: str = Field(..., min_length=4)
+    password: str = Field(..., min_length=8)
     full_name: str
     email: Optional[str] = None
 

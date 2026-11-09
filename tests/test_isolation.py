@@ -1,33 +1,19 @@
-from fastapi.testclient import TestClient
+﻿from fastapi.testclient import TestClient
+
 
 def test_cross_user_isolation(client: TestClient, student_a, student_b):
-    # 1. Login Student A using student ID number
-    res_a = client.post("/api/auth/login", json={"student_id": student_a["student_id"], "password": student_a["password"]})
+    res_a = client.post("/api/auth/register", json=student_a)
+    assert res_a.status_code == 200
     token_a = res_a.json()["token"]
-    user_a_id = res_a.json()["user"]["id"]
-    headers_a = {"Authorization": f"Bearer {token_a}", "X-User-Id": user_a_id, "X-User-Email": student_a["email"]}
+    assignment_response = client.post("/api/assignments", json={"course_name":"Operating Systems","assignment_title":"Kernel Concurrency","instructions":"Study semaphores"}, headers={"Authorization":"Bearer " + token_a})
+    assert assignment_response.status_code == 200, assignment_response.text
+    assignment_id = assignment_response.json()["id"]
 
-    # 2. Student A creates a private assignment
-    assign_res = client.post("/api/assignments", json={
-        "course_name": "Operating Systems",
-        "assignment_title": "Kernel Concurrency Assignment",
-        "instructions": "Study semaphores and mutexes."
-    }, headers=headers_a)
-    assert assign_res.status_code == 200
-    assign_id = assign_res.json()["id"]
-
-    # 3. Login Student B using their own student ID number
-    res_b = client.post("/api/auth/login", json={"student_id": student_b["student_id"], "password": student_b["password"]})
+    res_b = client.post("/api/auth/register", json=student_b)
+    assert res_b.status_code == 200
     token_b = res_b.json()["token"]
-    user_b_id = res_b.json()["user"]["id"]
-    headers_b = {"Authorization": f"Bearer {token_b}", "X-User-Id": user_b_id, "X-User-Email": student_b["email"]}
-
-    # 4. Student B attempts to access Student A's assignment directly -> MUST BE BLOCKED
-    blocked_get = client.get(f"/api/assignments/{assign_id}", headers=headers_b)
-    assert blocked_get.status_code in [403, 404]
-
-    # 5. Student B lists their own assignments -> Must NOT contain Student A's assignment
-    list_b = client.get("/api/assignments", headers=headers_b)
-    assert list_b.status_code == 200
-    b_ids = [item["id"] for item in list_b.json()]
-    assert assign_id not in b_ids
+    headers_b = {"Authorization": "Bearer " + token_b}
+    blocked = client.get(f"/api/assignments/{assignment_id}", headers=headers_b)
+    assert blocked.status_code in (403, 404)
+    own = client.get("/api/assignments", headers=headers_b)
+    assert assignment_id not in [item["id"] for item in own.json()]

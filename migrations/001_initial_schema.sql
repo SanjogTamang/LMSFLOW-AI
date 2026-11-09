@@ -118,6 +118,20 @@ CREATE TABLE IF NOT EXISTS public.submission_events (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Compatibility for deployments that previously used the standalone pipeline
+-- schema. These statements are safe to rerun after both CREATE TABLE branches.
+ALTER TABLE public.assignments ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE public.assignments ADD COLUMN IF NOT EXISTS current_status TEXT NOT NULL DEFAULT 'discovered';
+ALTER TABLE public.assignments ADD COLUMN IF NOT EXISTS lms_assignment_url TEXT;
+ALTER TABLE public.assignments ADD COLUMN IF NOT EXISTS submission_format TEXT DEFAULT 'pdf';
+ALTER TABLE public.assignments ADD COLUMN IF NOT EXISTS due_date TIMESTAMPTZ;
+ALTER TABLE public.assignments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE public.assignment_drafts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE public.submission_events ALTER COLUMN event_details TYPE JSONB USING event_details::jsonb;
+ALTER TABLE public.submission_events ALTER COLUMN event_details SET DEFAULT '{}'::jsonb;
+CREATE UNIQUE INDEX IF NOT EXISTS profiles_scu_student_id_key
+    ON public.profiles(scu_student_id) WHERE scu_student_id IS NOT NULL;
+
 -- ==============================================================================
 -- ROW LEVEL SECURITY (RLS) POLICIES
 -- Strict Isolation: users can ONLY access rows matching auth.uid() == user_id
@@ -133,38 +147,48 @@ ALTER TABLE public.submission_jobs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.submission_events ENABLE ROW LEVEL SECURITY;
 
 -- 1. Profiles Policies
+DROP POLICY IF EXISTS "Users view own profile" ON public.profiles;
 CREATE POLICY "Users view own profile" ON public.profiles
     FOR SELECT USING (auth.uid() = id);
+DROP POLICY IF EXISTS "Users update own profile" ON public.profiles;
 CREATE POLICY "Users update own profile" ON public.profiles
     FOR UPDATE USING (auth.uid() = id);
+DROP POLICY IF EXISTS "Users insert own profile" ON public.profiles;
 CREATE POLICY "Users insert own profile" ON public.profiles
     FOR INSERT WITH CHECK (auth.uid() = id);
 
 -- 2. Student LMS Connections Policies
+DROP POLICY IF EXISTS "Users manage own lms connection" ON public.student_lms_connections;
 CREATE POLICY "Users manage own lms connection" ON public.student_lms_connections
     FOR ALL USING (auth.uid() = user_id);
 
 -- 3. Courses Policies
+DROP POLICY IF EXISTS "Users manage own courses" ON public.courses;
 CREATE POLICY "Users manage own courses" ON public.courses
     FOR ALL USING (auth.uid() = user_id);
 
 -- 4. Assignments Policies
+DROP POLICY IF EXISTS "Users manage own assignments" ON public.assignments;
 CREATE POLICY "Users manage own assignments" ON public.assignments
     FOR ALL USING (auth.uid() = user_id);
 
 -- 5. Assignment Drafts Policies
+DROP POLICY IF EXISTS "Users manage own drafts" ON public.assignment_drafts;
 CREATE POLICY "Users manage own drafts" ON public.assignment_drafts
     FOR ALL USING (auth.uid() = user_id);
 
 -- 6. Generated Documents Policies
+DROP POLICY IF EXISTS "Users manage own documents" ON public.generated_documents;
 CREATE POLICY "Users manage own documents" ON public.generated_documents
     FOR ALL USING (auth.uid() = user_id);
 
 -- 7. Submission Jobs Policies
+DROP POLICY IF EXISTS "Users manage own jobs" ON public.submission_jobs;
 CREATE POLICY "Users manage own jobs" ON public.submission_jobs
     FOR ALL USING (auth.uid() = user_id);
 
 -- 8. Submission Events Policies
+DROP POLICY IF EXISTS "Users manage own events" ON public.submission_events;
 CREATE POLICY "Users manage own events" ON public.submission_events
     FOR ALL USING (auth.uid() = user_id);
 

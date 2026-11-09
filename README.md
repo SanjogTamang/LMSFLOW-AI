@@ -30,10 +30,11 @@ An enterprise-grade, multi-user academic platform designed for students of **Seo
 ## 🔒 Security & Multi-Tenant Isolation
 
 1. **No Shared Accounts**: Every student registers their own account and maintains an isolated session.
-2. **AES-256 Fernet Encryption**: Student LMS credentials are never stored in plaintext and never logged.
-3. **Database Row Level Security (RLS)**: Enforces that student A can never read, modify, or delete student B's courses, drafts, or PDFs.
-4. **Browser Session Isolation**: Each browser automation run spawns a fresh, independent browser context (`new_context`) with zero cookie or cache leakage between students.
-5. **Mandatory Approval & Safe Test Mode**: Prevents unintended submissions by requiring explicit confirmation and capturing proof screenshots before any upload.
+2. **Supabase Auth password sign-in**: Registration and login use Supabase Auth access tokens. API routes accept only bearer tokens; no trust is placed in `X-User-*` headers.
+3. **AES-256 Fernet Encryption**: Student LMS credentials are encrypted at rest with `LMS_CREDENTIAL_ENCRYPTION_KEY` and are never stored in plaintext.
+4. **Database Row Level Security (RLS)**: Client access can be RLS-constrained. The server uses a separate service-role client only for database operations and explicitly includes `user_id` filters on every tenant-owned table.
+5. **Browser Session Isolation**: Each browser automation run spawns a fresh, independent browser context (`new_context`) with zero cookie or cache leakage between students.
+6. **Mandatory Approval & Safe Test Mode**: Submission is disabled in the standalone pipeline unless explicitly enabled, and web submissions require explicit confirmation and evidence capture.
 
 ---
 
@@ -53,13 +54,16 @@ Ensure your real keys are in `.env`:
 ```ini
 GEMINI_API_KEY=your_gemini_key
 SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your_anon_key
-LMS_CREDENTIAL_ENCRYPTION_KEY=your_fernet_encryption_key
+SUPABASE_KEY=your_anon_public_key
+SUPABASE_SERVICE_ROLE_KEY=your_server_only_service_role_secret
+LMS_CREDENTIAL_ENCRYPTION_KEY=generate_with_cryptography_fernet_generate_key
 ```
 
 ### 3. Apply Supabase Database Migration
 In the **Supabase Dashboard** -> **SQL Editor**, run the contents of:
-[`migrations/001_initial_schema.sql`](file:///c:/Users/Sanjog/OneDrive/Desktop/lms%20project/migrations/001_initial_schema.sql)
+[`migrations/001_initial_schema.sql`](migrations/001_initial_schema.sql)
+
+This migration is versioned for compatibility with earlier pipeline deployments, but it is not applied remotely by this project. Verify migration success in your own Supabase project before starting production traffic.
 
 ### 4. Start the Application
 Run via the Windows batch script:

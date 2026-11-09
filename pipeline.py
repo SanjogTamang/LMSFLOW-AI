@@ -31,11 +31,20 @@ def require_env(name: str) -> str:
     return value
 
 
-# Initialize clients using Cloud System Secrets
-gemini_client = genai.Client(api_key=require_env("GEMINI_API_KEY"))
-supabase: Client = create_client(
-    require_env("SUPABASE_URL"), require_env("SUPABASE_KEY")
-)
+# Standalone CLI clients are initialized only when a command actually runs.
+gemini_client = None
+supabase: Client = None
+PIPELINE_USER_ID = os.getenv("SUPABASE_PIPELINE_USER_ID", "")
+
+
+def initialize_clients():
+    global gemini_client, supabase
+    gemini_client = genai.Client(api_key=require_env("GEMINI_API_KEY"))
+    supabase = create_client(
+        require_env("SUPABASE_URL"), require_env("SUPABASE_SERVICE_ROLE_KEY")
+    )
+    if not PIPELINE_USER_ID:
+        raise EnvironmentError("SUPABASE_PIPELINE_USER_ID must identify the owner of pipeline rows")
 
 # Prioritize active models with available quota
 GEMINI_MODELS = [
@@ -230,9 +239,17 @@ def generate_solution_pdf(
 
 def run_scheduled_jobs():
     print("\n[Worker] Checking Supabase for pending student automation requests...")
+    if os.getenv("LMS_PIPELINE_ALLOW_SUBMISSION", "").lower() != "true":
+        raise PermissionError("Remote LMS submission disabled; set LMS_PIPELINE_ALLOW_SUBMISSION=true only for explicit runs")
 
+    initialize_clients()
     response = (
-        supabase.table("assignments").select("*").eq("status", "scheduled").execute()
+        supabase.table("assignments")
+        .select("*")
+        .eq("user_id", PIPELINE_USER_ID)
+        .eq("source", "pipeline")
+        .neq("current_status", "completed")
+        .execute()
     )
     scheduled_jobs = response.data
 
@@ -329,11 +346,8 @@ def run_scheduled_jobs():
 
             # Update status in Supabase to 'completed'
             supabase.table("assignments").update(
-                {
-                    "status": "completed",
-                    "refined_markdown": solution_markdown,
-                }
-            ).eq("id", record_id).execute()
+                {"current_status": "completed", "instructions": scraped_prompt}
+            ).eq("id", record_id).eq("user_id", PIPELINE_USER_ID).execute()
 
             print(f"🎉 Successfully completed and submitted Record #{record_id}!")
 
@@ -341,35 +355,4 @@ def run_scheduled_jobs():
 
 
 if __name__ == "__main__":
-    # If no pending scheduled jobs exist in Supabase, create a test record
-    check_response = (
-        supabase.table("assignments").select("id").eq("status", "scheduled").execute()
-    )
-    if not check_response.data:
-        print("[Setup] No pending jobs found in Supabase. Inserting test scheduled assignment...")
-        sample_course = "Database Systems"
-        sample_week = 5
-        sample_notes = (
-            "Study SQL Joins and relational normalization (1NF to 3NF). "
-            "Write three practical SQL queries utilizing INNER JOIN, LEFT JOIN, and GROUP BY with aggregate functions. "
-            "Explain indexing benefits and provide recommendations for query optimization."
-        )
-        test_user = require_env("LMS_USER_ID")
-        test_pw = require_env("LMS_USER_PW")
-
-        new_record = {
-            "course_name": sample_course,
-            "week_number": sample_week,
-            "assignment_title": f"Week {sample_week} Assignment: {sample_course}",
-            "raw_text": sample_notes,
-            "status": "scheduled",
-            "lms_user_id": test_user,
-            "lms_password": test_pw,
-        }
-        res = supabase.table("assignments").insert(new_record).execute()
-        new_id = res.data[0]["id"]
-        print(f"[Setup] ✅ Test assignment created with Record ID: {new_id}")
-
-    run_scheduled_jobs()
-
     run_scheduled_jobs()

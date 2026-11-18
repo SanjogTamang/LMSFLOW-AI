@@ -1,7 +1,9 @@
+
 import os
 import sys
 from pathlib import Path
-from fastapi import FastAPI, Request
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -9,11 +11,15 @@ from fastapi.responses import FileResponse
 # Ensure UTF-8 in stdout/stderr
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from backend.config import settings
+
 from backend.routers import (
+    workflow_router,
+    guest_router,
     auth_router,
     lms_router,
     assignments_router,
@@ -22,6 +28,7 @@ from backend.routers import (
     jobs_router,
 )
 
+# Create FastAPI application FIRST
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
@@ -38,6 +45,8 @@ app.add_middleware(
 )
 
 # Register API Routers
+app.include_router(workflow_router.router)
+app.include_router(guest_router.router)
 app.include_router(auth_router.router)
 app.include_router(lms_router.router)
 app.include_router(assignments_router.router)
@@ -50,14 +59,24 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 FRONTEND_DIR.mkdir(parents=True, exist_ok=True)
 
 if (FRONTEND_DIR / "static").exists():
-    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR / "static")), name="static")
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(FRONTEND_DIR / "static")),
+        name="static",
+    )
+
 
 @app.get("/")
 def serve_index():
     index_file = FRONTEND_DIR / "index.html"
+
     if index_file.exists():
         return FileResponse(str(index_file))
-    return {"message": "SCU LMS Multi-User Platform API is running. Access /docs for interactive Swagger API."}
+
+    return {
+        "message": "SCU LMS Platform API is running. Access /docs."
+    }
+
 
 @app.get("/health")
 def health_check():
@@ -65,10 +84,16 @@ def health_check():
         "status": "healthy",
         "platform": settings.PROJECT_NAME,
         "version": settings.VERSION,
-        "lms_target": settings.SCU_LMS_URL
+        "lms_target": settings.SCU_LMS_URL,
     }
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.main:app", host=settings.APP_HOST, port=settings.APP_PORT, reload=True)
 
+    uvicorn.run(
+        "backend.main:app",
+        host=settings.APP_HOST,
+        port=settings.APP_PORT,
+        reload=True,
+    )

@@ -1,23 +1,86 @@
-import os
-import textwrap
+
+import time
 from typing import Optional
+
 from google import genai
 from backend.config import settings
 
-# Active models prioritized by quota availability
+
 GEMINI_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
 ]
 
+
 def get_gemini_client() -> Optional[genai.Client]:
-    """Initialize Google GenAI client with configured API key."""
     if not settings.GEMINI_API_KEY:
         return None
+
     try:
         return genai.Client(api_key=settings.GEMINI_API_KEY)
     except Exception:
         return None
+
+
+def is_temporary_error(error: Exception) -> bool:
+    message = str(error).upper()
+
+    temporary_errors = [
+        "503", "UNAVAILABLE",
+        "429", "RESOURCE_EXHAUSTED",
+        "500", "502", "504", "INTERNAL",
+    ]
+
+    return any(code in message for code in temporary_errors)
+
+
+def call_gemini(prompt: str) -> tuple[str, str]:
+    client = get_gemini_client()
+
+    if not client:
+        raise RuntimeError(
+            "Gemini API key is missing. Check your .env file."
+        )
+
+    last_error = None
+
+    for model_name in GEMINI_MODELS:
+        for attempt in range(3):
+            try:
+                print(
+                    f"Trying Gemini model: {model_name} "
+                    f"(attempt {attempt + 1}/3)"
+                )
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+
+                if response and response.text:
+                    print(f"Success using {model_name}")
+                    return response.text.strip(), model_name
+
+                raise RuntimeError("Gemini returned an empty response.")
+
+            except Exception as e:
+                last_error = e
+                print(f"Gemini error: {e}")
+
+                if not is_temporary_error(e):
+                    break
+
+                if attempt < 2:
+                    wait_time = 2 * (attempt + 1)
+                    print(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+
+    raise RuntimeError(f"Gemini request failed: {last_error}")
+
+
+# ============================================================
+# ASSIGNMENT GENERATION
+# ============================================================
 
 def generate_assignment_solution(
     course_name: str,
@@ -25,72 +88,93 @@ def generate_assignment_solution(
     instructions: str,
     student_notes: Optional[str] = None,
 ) -> tuple[str, str]:
-    """
-    Sends the course instructions to Gemini to generate an academic draft.
-    Returns: (solution_markdown, model_name_used)
-    """
-    client = get_gemini_client()
-    
+
     prompt = f"""
-    You are an expert academic tutor assisting a student in the university course: '{course_name}'.
+You are a university assignment assistant.
 
-    Assignment Title: {assignment_title}
+Course: {course_name}
+Assignment: {assignment_title}
 
-    Professor's Assignment Requirements:
-    {instructions if instructions else 'Provide a comprehensive research paper, analysis, or technical implementation report for this course assignment.'}
+Official instructions:
+{instructions or "No instructions were extracted. Ask the student to provide them."}
 
-    Additional Student Notes or Context:
-    {student_notes if student_notes else 'None provided.'}
+Student requirements:
+{student_notes or "None"}
 
-    Instructions for your response:
-    1. Structure your output clearly with Markdown headings:
-       # {assignment_title}
-       ## 1. Executive Summary & Overview
-       ## 2. Core Methodologies & Analysis
-       ## 3. Implementation Details & Solutions
-       ## 4. Discussion & Critical Findings
-       ## 5. Conclusion & Recommendations
-    2. Write an accurate, rigorous, high-quality academic response directly satisfying every instruction.
-    3. Do NOT fabricate fake sources or claim physical experiments occurred if they did not.
-    4. Provide concrete code, tables, or step-by-step logic where appropriate.
-    """
+STRICT RULES:
 
-    if not client:
-        # Fallback template if API key is not configured or in mock test mode
-        mock_solution = textwrap.dedent(f"""\
-            # {assignment_title}
-            
-            ## 1. Executive Summary & Overview
-            This assignment report addresses the core requirements specified for **{course_name}**.
-            The primary objective is to investigate relevant methodologies, examine domain principles, and deliver a coherent, structured solution.
-            
-            ## 2. Core Methodologies & Analysis
-            - **Requirement Analysis**: Evaluated instructions for completeness and constraints.
-            - **Methodological Framework**: Applied standard paradigms consistent with university-level curriculum.
-            - **Data & Theoretical Modeling**: Analyzed key operational inputs and boundary conditions.
-            
-            ## 3. Implementation Details & Solutions
-            Detailed analysis confirming all grading rubric expectations have been systematically met.
-            
-            ## 4. Discussion & Critical Findings
-            Key insights emphasize robust architectural design, thorough validation, and compliance with course specifications.
-            
-            ## 5. Conclusion & Recommendations
-            The presented solution satisfies all assignment criteria with clarity and academic integrity.
-        """)
-        return mock_solution, "offline-template-fallback"
+1. Produce only the actual assignment answer.
+2. Never write emails or letters to professors.
+3. Never include greetings or formal introductions.
+4. Use simple, natural English and make a short answer in a well managed way.
+5. Answer exactly what the assignment requires.
+6. Keep ordinary written answers around 40-60 words.
+7. Use headings only when necessary.
+8. Avoid unnecessary explanations and conclusions.
+9. For coding assignments, provide complete runnable code.
+10. Never invent journal papers, authors, references, datasets,
+    experimental results, or research findings.
+11. Never replace a required real dataset with dummy data.
+12. If essential information is missing, explain briefly what is needed.
+13. Never claim files or ZIPs have already been created.
+14. Never claim code has been tested unless it actually has.
 
-    last_error = None
-    for model_name in GEMINI_MODELS:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            if response and response.text:
-                return response.text, model_name
-        except Exception as e:
-            last_error = e
+Return ONLY the assignment content in Markdown.
+Keep it concise and complete.
+"""
 
-    raise RuntimeError(f"All Gemini models failed to generate solution. Error: {last_error}")
+    return call_gemini(prompt)
 
+
+# ============================================================
+# ASSIGNMENT CHATBOT
+# ============================================================
+
+def chat_with_assignment(
+    course_name: str,
+    assignment_title: str,
+    instructions: str,
+    messages: list[dict],
+) -> tuple[str, str]:
+
+    conversation = "\n".join(
+        f"{'Student' if m.get('role') == 'user' else 'Gemini'}: "
+        f"{m.get('content', '')}"
+        for m in messages
+    )
+
+    prompt = f"""
+You are a friendly AI assignment chatbot.
+
+Course: {course_name}
+Assignment: {assignment_title}
+
+Official assignment instructions:
+{instructions or "Instructions are missing. Ask the student to provide them."}
+
+Conversation so far:
+{conversation or "This is the beginning of the conversation."}
+
+YOUR BEHAVIOR:
+
+1. If this is the beginning, briefly introduce yourself as the
+   assignment assistant and ask whether the student wants to add
+   anything or generate the assignment.
+2. Answer the student's questions about the assignment.
+3. Allow the student to provide additional requirements.
+4. Remember and use the conversation history.
+5. Keep every reply short, friendly and simple.
+6. Prefer 1-5 sentences for ordinary chat replies.
+7. Do not generate the complete assignment unless requested.
+8. Never write professor emails or formal submission letters.
+9. Never invent papers, references, datasets, or results.
+10. If essential information is missing, ask one short question.
+11. Never claim that a PDF, ZIP, or Python project was created.
+12. Never submit anything without student approval.
+
+You are chatting with a student, not writing the assignment.
+
+Reply naturally and concisely.
+"""
+
+    return call_gemini(prompt)

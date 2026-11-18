@@ -57,18 +57,61 @@ def get_latest_draft(assignment_id: str, current_user: AuthenticatedUser = Depen
     return _draft(row) if row else None
 
 
+
 @router.put("/{assignment_id}/draft", response_model=DraftResponse)
-def update_draft(assignment_id: str, req: UpdateDraftRequest, current_user: AuthenticatedUser = Depends(get_current_user)):
+def update_draft(
+    assignment_id: str,
+    req: UpdateDraftRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
     db = get_database()
+
+    _owned_assignment(db, assignment_id, current_user.id)
+
     draft = _latest_draft(db, assignment_id, current_user.id)
+
     if not draft:
         raise HTTPException(404, "No existing draft to update")
-    values = {"draft_markdown": req.draft_markdown}
+
+    values = {
+        "draft_markdown": req.draft_markdown,
+        "is_student_approved": False,
+        "approved_at": None,
+    }
+
     if req.draft_title is not None:
         values["draft_title"] = req.draft_title
-    db.update("assignment_drafts", {"id": draft["id"], "user_id": current_user.id}, values)
-    updated = db.select("assignment_drafts", {"id": draft["id"], "user_id": current_user.id}, single=True)
+
+    db.update(
+        "assignment_drafts",
+        {
+            "id": draft["id"],
+            "user_id": current_user.id,
+        },
+        values,
+    )
+
+    db.update(
+        "assignments",
+        {
+            "id": assignment_id,
+            "user_id": current_user.id,
+        },
+        {"current_status": "draft_generated"},
+    )
+
+    updated = db.select(
+        "assignment_drafts",
+        {
+            "id": draft["id"],
+            "user_id": current_user.id,
+        },
+        single=True,
+    )
+
     return _draft(updated)
+
+
 
 
 @router.post("/{assignment_id}/approve")

@@ -25,3 +25,5 @@ tempCodeRunnerFile.py
 .vscode/
 .DS_Store
 Thumbs.db
+storage/
+*.inspect_login

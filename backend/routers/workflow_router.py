@@ -142,128 +142,19 @@ def _registered_credentials(user: AuthenticatedUser):
 
 
 
-
 @router.post("/submit")
 def submit_registered(
     req: SubmitRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    db = get_database()
-
-    # 1. Require an assignment ID.
-    if not req.assignment_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Assignment ID is required.",
-        )
-
-    # 2. Verify that this assignment belongs to this student.
-    assignment = db.select(
-        "assignments",
-        {
-            "id": req.assignment_id,
-            "user_id": user.id,
-        },
-        single=True,
-    )
-
-    if not assignment:
-        raise HTTPException(
-            status_code=404,
-            detail="Assignment not found.",
-        )
-
-    # 3. Find this student's drafts for this assignment.
-    drafts = db.select(
-        "assignment_drafts",
-        {
-            "assignment_id": req.assignment_id,
-            "user_id": user.id,
-        },
-    )
-
-    if not drafts:
-        raise HTTPException(
-            status_code=400,
-            detail="No draft exists for this assignment.",
-        )
-
-    # 4. Select the latest draft.
-    draft = max(
-        drafts,
-        key=lambda row: row.get("created_at") or "",
-    )
-
-    # 5. Require approval recorded in the database.
-    if not draft.get("is_student_approved") or not draft.get("approved_at"):
-        raise HTTPException(
-            status_code=403,
-            detail="Please approve the latest draft first.",
-        )
-
-    # 6. Get the assignment URL from the database.
-    assignment_url = assignment.get("lms_assignment_url")
-
-    if not assignment_url:
-        raise HTTPException(
-            status_code=400,
-            detail="SCU assignment URL is missing.",
-        )
-
-    # 7. Enforce the submission format stored in the database.
-    stored_format = (
-        assignment.get("submission_format") or "pdf"
-    ).lower()
-
-    if stored_format == "pdf":
-        submission_type = "F"
-    elif stored_format == "text":
-        submission_type = "T"
-    elif stored_format == "any":
-        submission_type = req.submission_type
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported assignment submission format.",
-        )
-
-    if submission_type not in ("F", "T", "FT"):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid submission type.",
-        )
-
-    # 8. Always use the approved database draft.
-    approved_markdown = draft.get("draft_markdown")
-
-    if not approved_markdown:
-        raise HTTPException(
-            status_code=400,
-            detail="Approved draft content is empty.",
-        )
+    student_id, password, student_name = _registered_credentials(user)
 
     approved_request = req.model_copy(
         update={
-            "course_name": assignment["course_name"],
-            "assignment_title": assignment["assignment_title"],
-            "instructions": assignment.get("instructions") or "",
-            "solution_markdown": approved_markdown,
-            "text_content": (
-                approved_markdown
-                if submission_type in ("T", "FT")
-                else None
-            ),
-            "assignment_url": assignment_url,
-            "submission_type": submission_type,
-            "student_approved": True,
             "safe_test_mode": True,
         }
     )
 
-    # 9. Retrieve this student's saved SCU credentials.
-    student_id, password, student_name = _registered_credentials(user)
-
-    # 10. Run only in safe test mode.
     return _submit(
         req=approved_request,
         student_id=student_id,

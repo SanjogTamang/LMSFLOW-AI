@@ -1,43 +1,54 @@
+
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, EmailStr, Field
 
+
 # ── User & Auth Models ────────────────────────────────────────────────────────
+
 class RegisterRequest(BaseModel):
-    student_id: str = Field(..., min_length=4, description="SCU Student ID number, e.g. 20240301001")
+    email: EmailStr
     password: str = Field(..., min_length=8)
-    full_name: str
-    email: Optional[str] = None
+    full_name: str = Field(..., min_length=2)
+
 
 class LoginRequest(BaseModel):
-    student_id: str = Field(..., description="SCU Student ID number (e.g. 20240301001) or Email")
+    # Accepts platform email, or an older SCU student ID for compatibility.
+    student_id: str = Field(..., min_length=1, description="Platform email or legacy SCU student ID")
     password: str
+
 
 class UserProfileResponse(BaseModel):
     id: str
-    scu_student_id: str
+    scu_student_id: Optional[str] = None
     email: Optional[str] = None
     full_name: str
     is_scu_verified: bool = False
     created_at: Optional[str] = None
+
 
 class AuthResponse(BaseModel):
     token: str
     user: UserProfileResponse
     message: str
 
+
 # ── LMS Connection Models ────────────────────────────────────────────────────
+
 class ConnectLMSRequest(BaseModel):
     lms_student_id: str
     lms_password: str
 
+
 class LMSConnectionResponse(BaseModel):
     user_id: str
     lms_student_id: str
-    connection_status: str  # 'connected', 'disconnected', 'failed', 'requires_mfa'
+    connection_status: str
     last_verified_at: Optional[str] = None
     last_error_message: Optional[str] = None
 
+
 # ── Assignment & Course Models ───────────────────────────────────────────────
+
 class AssignmentCreateRequest(BaseModel):
     course_name: str
     assignment_title: str
@@ -45,6 +56,7 @@ class AssignmentCreateRequest(BaseModel):
     due_date: Optional[str] = None
     submission_format: Optional[str] = "pdf"
     lms_assignment_url: Optional[str] = None
+
 
 class AssignmentResponse(BaseModel):
     id: str
@@ -57,13 +69,17 @@ class AssignmentResponse(BaseModel):
     current_status: str
     created_at: Optional[str] = None
 
+
 # ── Draft & AI Models ────────────────────────────────────────────────────────
+
 class GenerateDraftRequest(BaseModel):
     custom_instructions: Optional[str] = None
+
 
 class UpdateDraftRequest(BaseModel):
     draft_title: Optional[str] = None
     draft_markdown: str
+
 
 class DraftResponse(BaseModel):
     id: str
@@ -76,7 +92,9 @@ class DraftResponse(BaseModel):
     approved_at: Optional[str] = None
     created_at: Optional[str] = None
 
+
 # ── Document & PDF Models ────────────────────────────────────────────────────
+
 class DocumentResponse(BaseModel):
     id: str
     user_id: str
@@ -85,7 +103,9 @@ class DocumentResponse(BaseModel):
     file_size_bytes: Optional[int] = 0
     created_at: Optional[str] = None
 
+
 # ── Job & Audit Models ───────────────────────────────────────────────────────
+
 class JobResponse(BaseModel):
     id: str
     user_id: str
@@ -97,6 +117,6 @@ class JobResponse(BaseModel):
     error_message: Optional[str] = None
     created_at: Optional[str] = None
 
+
 class SubmissionApprovalRequest(BaseModel):
     confirm_submission: bool = True
-

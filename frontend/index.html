@@ -31,6 +31,11 @@
       const [fullName, setFullName] = useState("");
       const [email, setEmail] = useState("");
 
+      // Independent show/hide controls for each password field.
+      const [showPassword, setShowPassword] = useState(false);
+      const [showGuestLmsPassword, setShowGuestLmsPassword] = useState(false);
+      const [showLmsPassword, setShowLmsPassword] = useState(false);
+
       const [lmsId, setLmsId] = useState("");
       const [lmsPassword, setLmsPassword] = useState("");
 
@@ -104,14 +109,27 @@
             : {
                 student_id: studentId.trim(),
                 password,
-                full_name: fullName,
-                email: email || `${studentId.trim()}@scu.ac.kr`
+                full_name: fullName.trim(),
+                email: email.trim().toLowerCase()
               };
 
           const data = await api(endpoint, {
             method: "POST",
             body: JSON.stringify(payload)
           }, false);
+
+          // With email confirmation enabled, Supabase may create the account
+          // without issuing a session. Do not treat an empty token as logged in.
+          if (mode === "register" && !data.token) {
+            setPassword("");
+            setMode("login");
+            notify(data.message || "Account created. Check your email to confirm your account, then log in.");
+            return;
+          }
+
+          if (!data.token) {
+            throw new Error("Authentication succeeded without an access token. Please try logging in again.");
+          }
 
           setToken(data.token);
           setUser(data.user);
@@ -637,21 +655,35 @@
                   />
                   <input
                     className="w-full border rounded-lg p-3"
-                    placeholder="Email (optional)"
+                    placeholder="Gmail address"
                     type="email"
                     value={email}
                     onChange={e => setEmail(e.target.value)}
+                    autoComplete="email"
+                    required
                   />
                 </>}
 
-                <input
-                  className="w-full border rounded-lg p-3"
-                  placeholder="Password"
-                  type="password"
-                  value={password}
-                  onChange={e => setPassword(e.target.value)}
-                  required
-                />
+                <div className="relative">
+                  <input
+                    className="w-full border rounded-lg p-3 pr-16"
+                    placeholder="Application password"
+                    type={showPassword ? "text" : "password"}
+                    value={password}
+                    onChange={e => setPassword(e.target.value)}
+                    autoComplete={mode === "login" ? "current-password" : "new-password"}
+                    required
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(value => !value)}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                    aria-pressed={showPassword}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-sm font-medium text-blue-700"
+                  >
+                    {showPassword ? "Hide" : "Show"}
+                  </button>
+                </div>
 
                 <button disabled={loading} className="w-full bg-blue-950 text-white p-3 rounded-lg font-semibold disabled:opacity-50">
                   {loading ? "Please wait..." : mode === "login" ? "Sign In" : "Register"}
@@ -711,14 +743,26 @@
                 required
               />
 
-              <input
-                className="w-full border rounded-lg p-3"
-                placeholder="SCU LMS Password"
-                type="password"
-                value={lmsPassword}
-                onChange={e => setLmsPassword(e.target.value)}
-                required
-              />
+              <div className="relative">
+                <input
+                  className="w-full border rounded-lg p-3 pr-16"
+                  placeholder="SCU LMS Password"
+                  type={showGuestLmsPassword ? "text" : "password"}
+                  value={lmsPassword}
+                  onChange={e => setLmsPassword(e.target.value)}
+                  autoComplete="current-password"
+                  required
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowGuestLmsPassword(value => !value)}
+                  aria-label={showGuestLmsPassword ? "Hide SCU LMS password" : "Show SCU LMS password"}
+                  aria-pressed={showGuestLmsPassword}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-sm font-medium text-blue-700"
+                >
+                  {showGuestLmsPassword ? "Hide" : "Show"}
+                </button>
+              </div>
 
               <button disabled={loading} className="w-full bg-blue-950 text-white p-3 rounded-lg font-semibold">
                 {loading ? "Connecting..." : "Connect and Scan Assignments"}
@@ -758,14 +802,26 @@
                 required
               />
 
-              <input
-                className="w-full border rounded-lg p-3"
-                placeholder="SCU LMS Password"
-                type="password"
-                value={lmsPassword}
-                onChange={e => setLmsPassword(e.target.value)}
-                required
-              />
+              <div className="relative">
+                <input
+                  className="w-full border rounded-lg p-3 pr-16"
+                  placeholder="SCU LMS Password"
+                  type={showLmsPassword ? "text" : "password"}
+                  value={lmsPassword}
+                  onChange={e => setLmsPassword(e.target.value)}
+                  autoComplete="current-password"
+                  required
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowLmsPassword(value => !value)}
+                  aria-label={showLmsPassword ? "Hide SCU LMS password" : "Show SCU LMS password"}
+                  aria-pressed={showLmsPassword}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-sm font-medium text-blue-700"
+                >
+                  {showLmsPassword ? "Hide" : "Show"}
+                </button>
+              </div>
 
               <button disabled={loading} className="w-full bg-blue-950 text-white p-3 rounded-lg font-semibold">
                 {loading ? "Verifying..." : "Verify and Connect"}

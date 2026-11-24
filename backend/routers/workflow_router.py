@@ -148,15 +148,11 @@ def submit_registered(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     student_id, password, student_name = _registered_credentials(user)
-
-    approved_request = req.model_copy(
-        update={
-            "safe_test_mode": True,
-        }
-    )
+ 
+    
 
     return _submit(
-        req=approved_request,
+        req=req,
         student_id=student_id,
         password=password,
         student_name=student_name,

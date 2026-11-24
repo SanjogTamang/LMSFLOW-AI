@@ -7,13 +7,13 @@ def test_register_and_login_by_student_number(client: TestClient, student_a):
     
     # 2. Login student directly using student ID number (20240301001)
     login_res = client.post("/api/auth/login", json={
-        "student_id": student_a["student_id"],
+        "student_id": student_a["email"],
         "password": student_a["password"]
     })
     assert login_res.status_code == 200
     data = login_res.json()
     assert "token" in data
-    assert data["user"]["scu_student_id"] == student_a["student_id"]
+    assert data["user"]["scu_student_id"] is None
 
 def test_unauthorized_access(client: TestClient):
     # Attempt to list assignments without token

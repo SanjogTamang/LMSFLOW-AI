@@ -58,3 +58,37 @@ def test_phase_a_merges_records_by_sanitized_assignment_url_when_ids_missing():
 
     assert len(result) == 1
     assert result[0]["status"] == "Pending"
+
+
+def test_api_discovery_uses_phase_a_and_keeps_existing_response_fields(monkeypatch):
+    import backend.services.scanner_phase_a as phase_a
+    from backend.services.playwright_lms import discover_student_assignments
+
+    def fake_run_phase_a(**kwargs):
+        assert kwargs["lms_student_id"] == "student123"
+        assert kwargs["lms_password"] == "local-test-password"
+        return [{
+            "course_name": "Computer Vision",
+            "assignment_title": "CNN Assignment",
+            "assignment_url": "https://lms.scu.ac.kr/assignment/123",
+            "submission_format": "File",
+            "instructions": "Build a CNN model.",
+            "status": "Pending",
+            "crs_cre_cd": "COURSE1",
+            "asmnt_cd": "ASMNT1",
+        }]
+
+    monkeypatch.setattr(phase_a, "run_phase_a", fake_run_phase_a)
+
+    result = discover_student_assignments(
+        "student123",
+        "local-test-password",
+        headless=True,
+    )
+
+    assert len(result) == 1
+    assert result[0]["course_name"] == "Computer Vision"
+    assert result[0]["assignment_title"] == "CNN Assignment"
+    assert result[0]["lms_assignment_url"] == "https://lms.scu.ac.kr/assignment/123"
+    assert result[0]["status"] == "Pending"
+    assert result[0]["details_extracted"] is True

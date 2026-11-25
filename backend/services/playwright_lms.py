@@ -196,46 +196,60 @@ def discover_student_assignments(
     lms_password: str,
     headless: bool = True,
 ) -> List[Dict[str, Any]]:
+    """
+    Discover assignments from MyPage and every enrolled course/week.
 
+    Both guest access and registered-student LMS sync call this function, so
+    the Phase-A scanner is shared without changing either API contract.
+    """
     if not lms_student_id or not lms_password:
         raise ValueError("SCU LMS credentials are required.")
 
-    print("[SCANNER] Starting the SCU assignment scanner...")
+    print("[SCANNER] Starting the full SCU course/week scanner...")
 
     try:
-        from scanner import scan_assignments
+        from backend.services.scanner_phase_a import run_phase_a
+        from translator import translator
 
-        scanned = scan_assignments(
+        raw_items = run_phase_a(
             headless=headless,
-            screenshot_on_fail=True,
-            username=lms_student_id,
-            password=lms_password,
-            use_env=False,
-            translate=True,
+            lms_student_id=lms_student_id,
+            lms_password=lms_password,
         )
 
-        assignments = []
+        assignments: List[Dict[str, Any]] = []
+        for index, item in enumerate(raw_items, start=1):
+            # Preserve the original Korean values while adding English fields.
+            bilingual = translator.translate_assignment_dict(item)
 
-        for index, item in enumerate(scanned, start=1):
-            course_original = item.get("course_name_original") or item.get("course_name") or ""
-            course_english = item.get("course_name_english") or course_original
+            course_original = (
+                item.get("course_name")
+                or item.get("course_name_ko")
+                or bilingual.get("course_name_original")
+                or "알 수 없음"
+            )
+            course_english = bilingual.get("course_name_english") or course_original
+
             title_original = (
-                item.get("assignment_title_original")
-                or item.get("assignment_title")
+                item.get("assignment_title")
                 or item.get("title")
+                or item.get("raw_title")
+                or bilingual.get("assignment_title_original")
                 or ""
             )
-            title_english = item.get("assignment_title_english") or title_original
-            assignment_url = item.get("assignment_url") or item.get("lms_assignment_url") or ""
-            submission_format = item.get("submission_format") or item.get("format") or ""
-            submission_format_english = (
-                item.get("submission_format_english")
-                or item.get("format_english")
-                or submission_format
-            )
+            title_english = bilingual.get("assignment_title_english") or title_original
 
-            assignment = {
+            assignment_url = (
+                item.get("assignment_url")
+                or item.get("lms_assignment_url")
+                or ""
+            )
+            submission_format = item.get("submission_format") or "파일"
+            submission_format_english = bilingual.get("submission_format_english") or submission_format
+
+            assignments.append({
                 **item,
+                **bilingual,
                 "id": str(index),
                 "course_name": course_english,
                 "course_name_original": course_original,
@@ -249,13 +263,16 @@ def discover_student_assignments(
                 "submission_format_english": submission_format_english,
                 "format": submission_format,
                 "format_english": submission_format_english,
-                "instructions": item.get("instructions") or item.get("instructions_english") or "",
+                "instructions": (
+                    bilingual.get("instructions_english")
+                    or item.get("instructions")
+                    or ""
+                ),
                 "status": item.get("status", "Unknown"),
-                "details_extracted": True,
-            }
-            assignments.append(assignment)
+                "details_extracted": bool(assignment_url) and not item.get("error"),
+            })
 
-        print(f"[SCANNER] Scan completed. Found {len(assignments)} assignments.")
+        print(f"[SCANNER] Full scan completed. Found {len(assignments)} assignment(s).")
         return assignments
 
     except Exception as exc:

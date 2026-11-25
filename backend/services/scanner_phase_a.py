@@ -1,35 +1,17 @@
 """
-backend/services/scanner_phase_a.py
----------------------------------
-Phase A implementation – full SCU LMS scan.
+Read-only SCU LMS scanner: Learning Activity + every enrolled classroom/week.
 
-This module builds on the existing ``scanner.py`` (Learning‑Activity only) and
-the newly introduced ``scanner_helpers.py`` (network helpers).  The workflow is:
-
-1. Log in via Playwright (re‑using ``login_to_lms`` from ``playwright_lms``).
-2. Fetch all enrolled classrooms.
-3. For each classroom retrieve the weekly schedule.
-4. For every week request the five activity endpoints.  Currently we only
-   process assignments; the other categories are returned as‑is for future
-   expansion.
-5. Merge the weekly‑assignment results with the Learning‑Activity scan
-   (deduplication on ``(crs_cre_cd, asmnt_cd)``).
-6. Return a combined list of assignment dictionaries ready for the existing
-   translation pipeline.
-
-All network calls are performed through the Playwright ``page.request`` API so
-that the authenticated session (cookies, CSRF token, etc.) is automatically
-included.  Errors from any individual endpoint are logged and result in an
-empty list – they do not abort the whole scan.
+The original scanner remains the source of truth for login, MyPage parsing,
+assignment detail extraction, status classification, and URL sanitisation.
+This module adds weekly API discovery and merges those records with MyPage.
 """
 
 import logging
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
 
-from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright, Page
 
-# Re‑use existing services
-from backend.services.playwright_lms import (
+from scanner import (
     login_to_lms,
     navigate_to_learning_activity,
     extract_assignment_links,
@@ -40,189 +22,193 @@ from backend.services.scanner_helpers import (
     get_enrolled_classrooms,
     get_weekly_schedule,
     get_assignments,
-    get_exams,
-    get_discussions,
-    get_projects,
-    get_surveys,
 )
 
 log = logging.getLogger(__name__)
 
 
 def _scan_learning_activities(page: Page) -> List[Dict[str, Any]]:
-    """Reuse the original Learning‑Activity scanner logic.
-
-    Returns a list of assignment detail dictionaries (same shape as the weekly
-    scanner).  Errors are propagated as exceptions – the caller will handle them.
-    """
+    """Scan the existing MyPage Learning Activity list."""
     if not navigate_to_learning_activity(page):
-        raise RuntimeError("Learning Activity container not found")
-    links = extract_assignment_links(page)
+        log.warning("MyPage Learning Activity is unavailable; continuing with weekly discovery.")
+        return []
+
+    metadata = extract_assignment_links(page)
     results: List[Dict[str, Any]] = []
-    for meta in links:
-        details = extract_assignment_details(page, meta)
-        results.append(details)
+    for item in metadata:
+        results.append(extract_assignment_details(page, item))
     return results
 
 
-def _scan_weekly_assignments(page: Page, classroom: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Scan assignments for *all* weeks of a given classroom.
+def _course_name(classroom: Dict[str, Any]) -> str:
+    """Read a course label from the classroom payload without assuming one key."""
+    for key in ("courseName", "crsNm", "crsName", "courseNm", "name"):
+        value = classroom.get(key)
+        if value:
+            return str(value)
+    return ""
 
-    ``classroom`` is a dict returned by ``get_enrolled_classrooms`` and is
-    expected to contain at least ``crsCd`` and ``crsCreCd`` keys.
-    """
+
+def _scan_weekly_assignments(
+    page: Page,
+    classroom: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Fetch assignment metadata for each week and enrich it using the detail page."""
     crs_cd = classroom.get("crsCd")
     crs_cre_cd = classroom.get("crsCreCd")
     if not crs_cd or not crs_cre_cd:
-        log.warning("Classroom missing identifiers: %s", classroom)
+        log.warning("Skipping classroom with missing course identifiers.")
         return []
-    weeks = get_weekly_schedule(page, crs_cd, crs_cre_cd)
-    print(f"========== WEEKLY SCHEDULE DISCOVERY STARTED for classroom {crs_cd} ==========")
-    print(f"[WEEK DISCOVERY] Returned {len(weeks)} weeks")
-    weekly_assignments: List[Dict[str, Any]] = []
+
+    course_name = _course_name(classroom)
+    weeks = get_weekly_schedule(page, str(crs_cd), str(crs_cre_cd))
+    results: List[Dict[str, Any]] = []
+
     for week in weeks:
-        print("========== WEEKLY ASSIGNMENT REQUEST STARTED ==========")
-        raw_assigns = get_assignments(page, crs_cre_cd, week)
-        print(f"[ASSIGNMENT REQUEST] Received {len(raw_assigns)} assignments for week {week.get('lessonScheduleId')}")
-        for raw in raw_assigns:
-            meta = {
-                "crs_cre_cd": crs_cre_cd,
-                "asmnt_cd": raw.get("asmntCd"),
-                "title": raw.get("title", ""),
-                "course_name": classroom.get("courseName", ""),
-                "date_range_card": raw.get("dateRange", ""),
-                "href": raw.get("href", ""),
+        raw_assignments = get_assignments(page, str(crs_cre_cd), week)
+        log.info(
+            "Course %s week %s: %s assignment record(s)",
+            crs_cre_cd,
+            week.get("lessonScheduleId", "unknown"),
+            len(raw_assignments),
+        )
+
+        for raw in raw_assignments:
+            assignment_code = raw.get("asmntCd") or raw.get("asmnt_cd")
+            title = raw.get("title") or raw.get("asmntNm") or raw.get("asmntTitle") or ""
+            metadata = {
+                "crs_cre_cd": str(crs_cre_cd),
+                "asmnt_cd": str(assignment_code) if assignment_code else None,
+                "course_name": course_name,
+                "title": str(title),
+                "date_range_card": raw.get("dateRange") or raw.get("submitPeriod") or "",
+                "href": raw.get("href") or "",
+                "week_no": week.get("weekNo") or week.get("weekNum"),
+                "week_title": week.get("lessonScheduleNm") or week.get("title") or "",
+                "lesson_schedule_id": week.get("lessonScheduleId"),
             }
-            details = extract_assignment_details(page, meta)
-            weekly_assignments.append(details)
-        # Other activity categories – fetched for completeness (ignore payload)
-        get_exams(page, crs_cre_cd, week)
-        get_discussions(page, crs_cre_cd, week)
-        get_projects(page, crs_cre_cd, week)
-        get_surveys(page, crs_cre_cd, week)
-    return weekly_assignments
-    """Scan assignments for *all* weeks of a given classroom.
 
-    ``classroom`` is a dict returned by ``get_enrolled_classrooms`` and is
-    expected to contain at least ``crsCd`` and ``crsCreCd`` keys.
+            # Without the assignment code, the LMS detail page cannot be opened
+            # safely. Preserve the metadata instead of navigating with a null ID.
+            if not assignment_code:
+                log.warning("Weekly assignment has no assignment code; retaining metadata only.")
+                results.append({
+                    **metadata,
+                    "assignment_title": metadata["title"],
+                    "status": "Unknown",
+                    "error": "SCU response did not include asmntCd.",
+                })
+                continue
+
+            details = extract_assignment_details(page, metadata)
+            results.append({**metadata, **details})
+
+    return results
+
+
+def _deduplicate(
+    learning_activity: List[Dict[str, Any]],
+    weekly_results: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge records without collapsing unrelated items that lack LMS IDs."""
+    merged: List[Dict[str, Any]] = []
+    keyed: Dict[str, int] = {}
+
+    for item in learning_activity + weekly_results:
+        course_id = item.get("crs_cre_cd")
+        assignment_id = item.get("asmnt_cd")
+
+        if course_id and assignment_id:
+            key = f"id:{course_id}:{assignment_id}"
+        else:
+            url = item.get("assignment_url") or item.get("href")
+            if url:
+                key = f"url:{url}"
+            else:
+                # No stable identifier: retain the record rather than risk
+                # merging two different assignments with missing IDs.
+                merged.append(item)
+                continue
+
+        existing_index = keyed.get(key)
+        if existing_index is None:
+            keyed[key] = len(merged)
+            merged.append(item)
+            continue
+
+        existing = merged[existing_index]
+        # Prefer the record with a successfully extracted detail-page URL.
+        if not existing.get("assignment_url") and item.get("assignment_url"):
+            merged[existing_index] = {**existing, **item}
+        else:
+            merged[existing_index] = {**item, **existing}
+
+    return merged
+
+
+def run_phase_a(
+    headless: bool = True,
+    use_env: bool = False,
+    lms_student_id: Optional[str] = None,
+    lms_password: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
-    crs_cd = classroom.get("crsCd")
-    crs_cre_cd = classroom.get("crsCreCd")
-    if not crs_cd or not crs_cre_cd:
-        log.warning("Classroom missing identifiers: %s", classroom)
-        return []
-    weeks = get_weekly_schedule(page, crs_cd, crs_cre_cd)
-    weekly_assignments: List[Dict[str, Any]] = []
-    for week in weeks:
-        # Assignments (primary focus)
-        raw_assigns = get_assignments(page, crs_cre_cd, week)
-        for raw in raw_assigns:
-            meta = {
-                "crs_cre_cd": crs_cre_cd,
-                "asmnt_cd": raw.get("asmntCd"),
-                "title": raw.get("title", ""),
-                "course_name": classroom.get("courseName", ""),
-                "date_range_card": raw.get("dateRange", ""),
-                "href": raw.get("href", ""),
-            }
-            details = extract_assignment_details(page, meta)
-            weekly_assignments.append(details)
-        # Other activity categories – fetched for completeness (ignore payload)
-        get_exams(page, crs_cre_cd, week)
-        get_discussions(page, crs_cre_cd, week)
-        get_projects(page, crs_cre_cd, week)
-        get_surveys(page, crs_cre_cd, week)
-    return weekly_assignments
+    Run the full read-only scan.
 
-
-def _deduplicate(assignments_a: List[Dict[str, Any]], assignments_b: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Merge two assignment lists, de‑duplicating by ``(crs_cre_cd, asmnt_cd)``.
-
-    Preference is given to the richer weekly‑scan record (which contains the full
-    detail page).  If a key appears only in one list, that entry is kept.
+    API callers pass credentials directly. Interactive prompting remains
+    available for local command-line use.
     """
-    keyed: Dict[tuple, Dict[str, Any]] = {}
-    for a in assignments_a + assignments_b:
-        key = (a.get("crs_cre_cd"), a.get("asmnt_cd"))
-        if key not in keyed or not keyed[key].get("assignment_url"):
-            keyed[key] = a
-    return list(keyed.values())
+    if not lms_student_id or not lms_password:
+        lms_student_id, lms_password = prompt_student_credentials(use_env=use_env)
 
+    if not lms_student_id or not lms_password:
+        raise ValueError("SCU LMS student ID and password are required.")
 
-def run_phase_a(headless: bool = True, use_env: bool = False) -> List[Dict[str, Any]]:
-    """Execute Phase A – full read‑only scanner.
-
-    Returns a combined list of assignment dictionaries ready for the existing
-    translation layer.
-    """
-    print("========== PHASE A SCANNER ENTERED ==========")
-    username, password = prompt_student_credentials(use_env=use_env)
-
-    with sync_playwright() as p:
-        browser: Browser = p.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"])
+    log.info("Starting Phase-A SCU LMS discovery.")
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
             viewport={"width": 1280, "height": 800},
         )
-        page: Page = context.new_page()
+        page = context.new_page()
+
         try:
-            if not login_to_lms(page, username=username, password=password):
-                raise RuntimeError("Login failed")
+            if not login_to_lms(page, username=lms_student_id, password=lms_password):
+                raise RuntimeError("SCU LMS login failed.")
 
-            # 1️⃣ Learning Activity scan (existing implementation).
-            la_assignments = _scan_learning_activities(page)
+            learning_activity = _scan_learning_activities(page)
 
-            # 2️⃣ Weekly classroom scan.
-            print("========== CLASSROOM DISCOVERY STARTED ==========")
             classrooms = get_enrolled_classrooms(page)
-            print(f"[CLASSROOM DISCOVERY] Returned {len(classrooms)} classrooms")
-            weekly_assignments: List[Dict[str, Any]] = []
-            for cr in classrooms:
-                print(f"========== WEEKLY SCHEDULE DISCOVERY STARTED for classroom {cr.get('crsCd','?')} ==========")
-                weekly_assignments.extend(_scan_weekly_assignments(page, cr))
+            log.info("SCU LMS returned %s enrolled classroom(s).", len(classrooms))
 
-            # 3️⃣ Merge and deduplicate.
-            combined = _deduplicate(la_assignments, weekly_assignments)
+            weekly_results: List[Dict[str, Any]] = []
+            for classroom in classrooms:
+                weekly_results.extend(_scan_weekly_assignments(page, classroom))
+
+            combined = _deduplicate(learning_activity, weekly_results)
+            log.info(
+                "Phase-A scan complete: %s Learning Activity record(s), "
+                "%s weekly record(s), %s unique result(s).",
+                len(learning_activity),
+                len(weekly_results),
+                len(combined),
+            )
             return combined
         finally:
             context.close()
             browser.close()
 
-    """Execute Phase A – full read‑only scanner.
-
-    Returns a combined list of assignment dictionaries ready for the existing
-    translation layer.
-    """
-    username, password = prompt_student_credentials(use_env=use_env)
-
-    with sync_playwright() as p:
-        browser: Browser = p.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"])
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-        )
-        page: Page = context.new_page()
-        try:
-            if not login_to_lms(page, username=username, password=password):
-                raise RuntimeError("Login failed")
-
-            # 1️⃣ Learning Activity scan (existing implementation).
-            la_assignments = _scan_learning_activities(page)
-
-            # 2️⃣ Weekly classroom scan.
-            classrooms = get_enrolled_classrooms(page)
-            weekly_assignments: List[Dict[str, Any]] = []
-            for cr in classrooms:
-                weekly_assignments.extend(_scan_weekly_assignments(page, cr))
-
-            # 3️⃣ Merge and deduplicate.
-            combined = _deduplicate(la_assignments, weekly_assignments)
-            return combined
-        finally:
-            context.close()
-            browser.close()
 
 if __name__ == "__main__":
     import json
+
     results = run_phase_a(headless=False, use_env=True)
     print(json.dumps(results, ensure_ascii=False, indent=2))

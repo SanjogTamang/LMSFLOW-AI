@@ -203,7 +203,6 @@ def discover_student_assignments(
     print("[SCANNER] Starting the SCU assignment scanner...")
 
     try:
-
         from scanner import scan_assignments
 
         scanned = scan_assignments(
@@ -218,42 +217,17 @@ def discover_student_assignments(
         assignments = []
 
         for index, item in enumerate(scanned, start=1):
-
-            course_original = (
-                item.get("course_name_original")
-                or item.get("course_name")
-                or ""
-            )
-
-            course_english = (
-                item.get("course_name_english")
-                or course_original
-            )
-
+            course_original = item.get("course_name_original") or item.get("course_name") or ""
+            course_english = item.get("course_name_english") or course_original
             title_original = (
                 item.get("assignment_title_original")
                 or item.get("assignment_title")
                 or item.get("title")
                 or ""
             )
-
-            title_english = (
-                item.get("assignment_title_english")
-                or title_original
-            )
-
-            assignment_url = (
-                item.get("assignment_url")
-                or item.get("lms_assignment_url")
-                or ""
-            )
-
-            submission_format = (
-                item.get("submission_format")
-                or item.get("format")
-                or ""
-            )
-
+            title_english = item.get("assignment_title_english") or title_original
+            assignment_url = item.get("assignment_url") or item.get("lms_assignment_url") or ""
+            submission_format = item.get("submission_format") or item.get("format") or ""
             submission_format_english = (
                 item.get("submission_format_english")
                 or item.get("format_english")
@@ -262,53 +236,30 @@ def discover_student_assignments(
 
             assignment = {
                 **item,
-
                 "id": str(index),
-
                 "course_name": course_english,
                 "course_name_original": course_original,
                 "course_name_english": course_english,
-
                 "assignment_title": title_english,
                 "assignment_title_original": title_original,
                 "assignment_title_english": title_english,
-
                 "assignment_url": assignment_url,
                 "lms_assignment_url": assignment_url,
-
                 "submission_format": submission_format,
                 "submission_format_english": submission_format_english,
-
                 "format": submission_format,
                 "format_english": submission_format_english,
-
-                "instructions": (
-                    item.get("instructions")
-                    or item.get("instructions_english")
-                    or ""
-                ),
-
+                "instructions": item.get("instructions") or item.get("instructions_english") or "",
                 "status": item.get("status", "Unknown"),
-
                 "details_extracted": True,
             }
-
             assignments.append(assignment)
 
-        print(
-            f"[SCANNER] Scan completed. "
-            f"Found {len(assignments)} assignments."
-        )
-
+        print(f"[SCANNER] Scan completed. Found {len(assignments)} assignments.")
         return assignments
 
     except Exception as exc:
-
-        print(
-            f"[SCANNER ERROR] "
-            f"{type(exc).__name__}: {exc}"
-        )
-
+        print(f"[SCANNER ERROR] {type(exc).__name__}: {exc}")
         raise
 
 
@@ -763,6 +714,123 @@ def perform_lms_submission(
             except Exception:
                 evidence_path = ""
             return False, evidence_path, f"SCU LMS automation error: {type(exc).__name__}: {exc}"
+        finally:
+            context.close()
+            browser.close()
+# -----------------------------------------------------------
+# Phase A helpers - course, week, and assignment discovery
+# -----------------------------------------------------------
+# Phase A helpers - course, week, and assignment discovery
+# -----------------------------------------------------------
+# Phase A helpers - course, week, and assignment discovery
+# -----------------------------------------------------------
+from bs4 import BeautifulSoup
+
+def list_courses(page: Page) -> List[Dict[str, Any]]:
+    """Parse MyPage and return a list of enrolled subjects.
+    Returns dicts with crs_cre_cd, course_name_ko, classroom_url, semester.
+    """
+    if "myPage" not in page.url:
+        page.goto(settings.MY_PAGE_URL, wait_until="networkidle", timeout=20000)
+    page.wait_for_selector("#lecActListMyPage", timeout=15000)
+    soup = BeautifulSoup(page.content(), "html.parser")
+    container = soup.select_one("#lecActListMyPage")
+    courses: List[Dict[str, Any]] = []
+    if not container:
+        return courses
+    for block in container.select("blockquote"):
+        link = block.select_one("a.link")
+        if not link:
+            continue
+        href = link.get("href", "")
+        m = re.search(r"goToDetail\s*\(\s*['\"]CLASS['\"]\s*,\s*['\"](\w+)['\"]", href)
+        crs_cre_cd = m.group(1) if m else None
+        info_box = block.select_one("ul.info-box")
+        course_name = ""
+        semester = ""
+        if info_box:
+            lis = info_box.select("li")
+            if lis:
+                course_name = lis[0].get_text(strip=True)
+                if len(lis) > 1:
+                    semester = lis[1].get_text(strip=True)
+        classroom_url = f"{settings.BASE_URL}/home/mainHome/Form/classRoomMainForm?crsCreCd={crs_cre_cd}" if crs_cre_cd else ""
+        courses.append({
+            "crs_cre_cd": crs_cre_cd,
+            "course_name_ko": course_name,
+            "classroom_url": classroom_url,
+            "semester": semester,
+        })
+    return courses
+
+def list_weeks(page: Page, classroom_url: str) -> List[Dict[str, Any]]:
+    """Visit a classroom page and return available weeks.
+    Each dict contains week_no, title, and optional week_url.
+    """
+    page.goto(classroom_url, wait_until="networkidle", timeout=20000)
+    possible_selectors = ["#weekList a", "#weekList li a", ".week-list a", ".week-list li a"]
+    weeks: List[Dict[str, Any]] = []
+    for selector in possible_selectors:
+        elems = page.locator(selector)
+        count = elems.count()
+        if count > 0:
+            for i in range(count):
+                el = elems.nth(i)
+                txt = el.inner_text().strip()
+                m = re.search(r"Week\s*(\d+)", txt, re.IGNORECASE)
+                week_no = int(m.group(1)) if m else i + 1
+                href = el.get_attribute("href")
+                weeks.append({"week_no": week_no, "title": txt, "week_url": href})
+            break
+    return weeks
+
+def list_assignments_in_week(page: Page, week_target: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Retrieve assignments for a given week.
+    Returns the same structure as ``extract_assignment_links``.
+    """
+    url = week_target.get("week_url")
+    if url:
+        page.goto(url, wait_until="networkidle", timeout=20000)
+    else:
+        # click by visible text if URL not provided
+        selector = f"text={week_target.get('title')}"
+        page.click(selector, timeout=15000)
+        page.wait_for_load_state("networkidle", timeout=15000)
+    from scanner import extract_assignment_links
+    return extract_assignment_links(page)
+
+def discover_course_structure(lms_student_id: str, lms_password: str, headless: bool = True) -> List[Dict[str, Any]]:
+    """Phase A orchestrator – discover courses → weeks → assignments.
+    Returns enriched assignment dicts (including crs_cre_cd, week_no, etc.).
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        context, page = _create_isolated_context(browser)
+        try:
+            if not _login_to_lms(page, lms_student_id, lms_password):
+                raise RuntimeError("Login failed")
+            all_assignments: List[Dict[str, Any]] = []
+            courses = list_courses(page)
+            for crs in courses:
+                crs_id = crs.get("crs_cre_cd")
+                classroom_url = crs.get("classroom_url")
+                if not classroom_url:
+                    continue
+                weeks = list_weeks(page, classroom_url)
+                for wk in weeks:
+                    asmnts = list_assignments_in_week(page, wk)
+                    for a in asmnts:
+                        a.update({
+                            "crs_cre_cd": crs_id,
+                            "course_name_ko": crs.get("course_name_ko"),
+                            "week_no": wk.get("week_no"),
+                            "week_title": wk.get("title"),
+                        })
+                        from scanner import extract_assignment_details
+                        details = extract_assignment_details(page, a)
+                        a.update(details)
+                        all_assignments.append(a)
+            return all_assignments
         finally:
             context.close()
             browser.close()
